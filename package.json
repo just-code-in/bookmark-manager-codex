@@ -1,0 +1,14 @@
+{
+  "name": "bookmark-manager-codex",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -ws --if-present",
+    "build": "npm run build -ws --if-present",
+    "check": "npm run check -ws --if-present"
+  }
+}
