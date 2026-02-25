@@ -4,12 +4,14 @@ CREATE TABLE IF NOT EXISTS imports (
   file_name TEXT NOT NULL,
   started_at TEXT NOT NULL,
   finished_at TEXT,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
   total_bookmarks INTEGER NOT NULL DEFAULT 0,
   imported_count INTEGER NOT NULL DEFAULT 0,
   duplicate_count INTEGER NOT NULL DEFAULT 0,
   live_count INTEGER NOT NULL DEFAULT 0,
   redirected_count INTEGER NOT NULL DEFAULT 0,
-  dead_count INTEGER NOT NULL DEFAULT 0
+  dead_count INTEGER NOT NULL DEFAULT 0,
+  timeout_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS bookmarks (

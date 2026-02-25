@@ -5,6 +5,7 @@ export type UrlValidationResult = {
   finalUrl: string | null;
   statusCode: number | null;
   checkedAt: string;
+  timedOut: boolean;
 };
 
 function normalizeUrl(rawUrl: string): string | null {
@@ -54,7 +55,8 @@ export async function validateUrl(url: string): Promise<UrlValidationResult> {
       status: classifyStatus(url, headResponse.url, headResponse.status),
       finalUrl: headResponse.url,
       statusCode: headResponse.status,
-      checkedAt
+      checkedAt,
+      timedOut: false
     };
   } catch {
     try {
@@ -68,14 +70,17 @@ export async function validateUrl(url: string): Promise<UrlValidationResult> {
         status: classifyStatus(url, getResponse.url, getResponse.status),
         finalUrl: getResponse.url,
         statusCode: getResponse.status,
-        checkedAt
+        checkedAt,
+        timedOut: false
       };
     } catch {
+      const timedOut = signal.aborted;
       return {
         status: "dead",
         finalUrl: null,
         statusCode: null,
-        checkedAt
+        checkedAt,
+        timedOut
       };
     }
   }

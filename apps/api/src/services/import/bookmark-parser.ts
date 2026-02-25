@@ -23,7 +23,11 @@ function parseAttributes(raw: string): Record<string, string> {
   let match = ATTR_RE.exec(raw);
 
   while (match) {
-    attributes[match[1]] = decodeHtml(match[2]);
+    const key = match[1];
+    const value = match[2];
+    if (key && value) {
+      attributes[key] = decodeHtml(value);
+    }
     match = ATTR_RE.exec(raw);
   }
 
@@ -56,7 +60,10 @@ export function parseBookmarksFromHtml(html: string): ParsedBookmark[] {
   for (const line of lines) {
     const folderMatch = line.match(H3_TAG_RE);
     if (folderMatch) {
-      pendingFolder = decodeHtml(folderMatch[1].trim());
+      const folderName = folderMatch[1];
+      if (folderName) {
+        pendingFolder = decodeHtml(folderName.trim());
+      }
     }
 
     if (line.includes("<DL")) {
@@ -74,9 +81,11 @@ export function parseBookmarksFromHtml(html: string): ParsedBookmark[] {
 
     let anchorMatch = A_TAG_RE.exec(line);
     while (anchorMatch) {
-      const attributes = parseAttributes(anchorMatch[1]);
+      const rawAttributes = anchorMatch[1] ?? "";
+      const rawTitle = anchorMatch[2] ?? "";
+      const attributes = parseAttributes(rawAttributes);
       const normalizedUrl = normalizeUrl(attributes.HREF ?? "");
-      const title = decodeHtml(anchorMatch[2].trim());
+      const title = decodeHtml(rawTitle.trim());
 
       if (normalizedUrl && title.length > 0) {
         bookmarks.push({

@@ -19,4 +19,6 @@ export type ImportSummary = {
   live: number;
   redirected: number;
   dead: number;
+  timedOut: number;
+  durationMs: number;
 };

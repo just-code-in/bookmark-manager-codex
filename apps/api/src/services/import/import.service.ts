@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { BookmarkRepository } from "../../repositories/bookmark.repository";
 import { validateUrl } from "../url-validation/url-validator";
 import { parseBookmarksFromHtml } from "./bookmark-parser";
@@ -17,6 +19,8 @@ type ImportResponse = {
   live: number;
   redirected: number;
   dead: number;
+  timedOut: number;
+  durationMs: number;
 };
 
 async function runWithConcurrency<T>(
@@ -41,12 +45,22 @@ export class ImportService {
 
   async importBookmarks(input: ImportRequest): Promise<ImportResponse> {
     const startedAt = new Date().toISOString();
+    const startedAtMs = Date.now();
+    const importId = randomUUID();
+    await this.repository.createImportRun({
+      id: importId,
+      source: input.source,
+      fileName: input.fileName,
+      startedAt
+    });
+
     const parsed = parseBookmarksFromHtml(input.html);
-    const { inserted, duplicates } = await this.repository.upsertBookmarks(parsed);
+    const { inserted, duplicates } = await this.repository.upsertBookmarks(parsed, importId);
 
     let live = 0;
     let redirected = 0;
     let dead = 0;
+    let timedOut = 0;
     const validationUpdates: Array<{
       bookmarkId: string;
       result: Awaited<ReturnType<typeof validateUrl>>;
@@ -62,20 +76,25 @@ export class ImportService {
       if (validation.status === "live") live += 1;
       if (validation.status === "redirected") redirected += 1;
       if (validation.status === "dead") dead += 1;
+      if (validation.timedOut) timedOut += 1;
     });
     await this.repository.updateValidations(validationUpdates);
+    const durationMs = Date.now() - startedAtMs;
 
     const run = await this.repository.saveImportRun({
+      id: importId,
       source: input.source,
       fileName: input.fileName,
       startedAt,
       finishedAt: new Date().toISOString(),
+      durationMs,
       totalBookmarks: parsed.length,
       importedCount: inserted.length,
       duplicateCount: duplicates,
       liveCount: live,
       redirectedCount: redirected,
-      deadCount: dead
+      deadCount: dead,
+      timeoutCount: timedOut
     });
 
     return {
@@ -86,7 +105,9 @@ export class ImportService {
       duplicates,
       live,
       redirected,
-      dead
+      dead,
+      timedOut,
+      durationMs
     };
   }
 }

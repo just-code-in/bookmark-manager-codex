@@ -1,7 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { db } from "../db/client";
 import type { ParsedBookmark } from "../services/import/bookmark-parser";
 import type { UrlValidationResult } from "../services/url-validation/url-validator";
 
@@ -13,6 +12,7 @@ type StoredBookmark = ParsedBookmark & {
   finalUrl: string | null;
   httpStatusCode: number | null;
   checkedAt: string | null;
+  sourceImportId: string;
 };
 
 type ImportRun = {
@@ -21,17 +21,14 @@ type ImportRun = {
   fileName: string;
   startedAt: string;
   finishedAt: string;
+  durationMs: number;
   totalBookmarks: number;
   importedCount: number;
   duplicateCount: number;
   liveCount: number;
   redirectedCount: number;
   deadCount: number;
-};
-
-type JsonStore = {
-  bookmarks: StoredBookmark[];
-  imports: ImportRun[];
+  timeoutCount: number;
 };
 
 type UpsertResult = {
@@ -39,60 +36,86 @@ type UpsertResult = {
   duplicates: number;
 };
 
-const STORE_PATH = resolve(process.cwd(), "db", "store.json");
-
-async function ensureStoreFile() {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  try {
-    await readFile(STORE_PATH, "utf-8");
-  } catch {
-    const initial: JsonStore = { bookmarks: [], imports: [] };
-    await writeFile(STORE_PATH, JSON.stringify(initial, null, 2), "utf-8");
-  }
-}
-
-async function readStore(): Promise<JsonStore> {
-  await ensureStoreFile();
-  const raw = await readFile(STORE_PATH, "utf-8");
-  return JSON.parse(raw) as JsonStore;
-}
-
-async function writeStore(store: JsonStore) {
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), "utf-8");
-}
+type SaveImportRunInput = ImportRun;
+type CreateImportRunInput = {
+  id: string;
+  source: string;
+  fileName: string;
+  startedAt: string;
+};
 
 export class BookmarkRepository {
-  async upsertBookmarks(bookmarks: ParsedBookmark[]): Promise<UpsertResult> {
-    const store = await readStore();
-    const existing = new Set(store.bookmarks.map((bookmark) => bookmark.url));
-    const seenInBatch = new Set<string>();
+  async createImportRun(input: CreateImportRunInput): Promise<void> {
+    db.prepare(
+      `
+      INSERT INTO imports (
+        id, source, file_name, started_at, finished_at, duration_ms, total_bookmarks,
+        imported_count, duplicate_count, live_count, redirected_count, dead_count, timeout_count
+      )
+      VALUES (?, ?, ?, ?, NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+    `
+    ).run(input.id, input.source, input.fileName, input.startedAt);
+  }
+
+  async upsertBookmarks(
+    bookmarks: ParsedBookmark[],
+    sourceImportId: string
+  ): Promise<UpsertResult> {
     const inserted: StoredBookmark[] = [];
     let duplicates = 0;
 
-    for (const bookmark of bookmarks) {
-      if (existing.has(bookmark.url) || seenInBatch.has(bookmark.url)) {
-        duplicates += 1;
-        continue;
+    const insert = db.prepare(`
+      INSERT INTO bookmarks (
+        id, url, title, folder_path, date_added, source_import_id,
+        url_status, final_url, http_status_code, checked_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      for (const bookmark of bookmarks) {
+        const existing = db
+          .prepare("SELECT id FROM bookmarks WHERE url = ?")
+          .get(bookmark.url) as { id: string } | undefined;
+        if (existing) {
+          duplicates += 1;
+          continue;
+        }
+
+        const now = new Date().toISOString();
+        const row: StoredBookmark = {
+          id: randomUUID(),
+          url: bookmark.url,
+          title: bookmark.title,
+          folderPath: bookmark.folderPath,
+          dateAdded: bookmark.dateAdded,
+          sourceImportId,
+          createdAt: now,
+          updatedAt: now,
+          status: null,
+          finalUrl: null,
+          httpStatusCode: null,
+          checkedAt: null
+        };
+
+        insert.run(
+          row.id,
+          row.url,
+          row.title,
+          row.folderPath,
+          row.dateAdded,
+          row.sourceImportId,
+          row.status,
+          row.finalUrl,
+          row.httpStatusCode,
+          row.checkedAt,
+          row.createdAt,
+          row.updatedAt
+        );
+        inserted.push(row);
       }
+    });
 
-      seenInBatch.add(bookmark.url);
-      const now = new Date().toISOString();
-      const record: StoredBookmark = {
-        ...bookmark,
-        id: randomUUID(),
-        createdAt: now,
-        updatedAt: now,
-        status: null,
-        finalUrl: null,
-        httpStatusCode: null,
-        checkedAt: null
-      };
-
-      inserted.push(record);
-      store.bookmarks.push(record);
-    }
-
-    await writeStore(store);
+    tx();
     return { inserted, duplicates };
   }
 
@@ -100,34 +123,52 @@ export class BookmarkRepository {
     updates: Array<{ bookmarkId: string; result: UrlValidationResult }>
   ): Promise<void> {
     if (updates.length === 0) return;
-    const store = await readStore();
-    const byId = new Map(updates.map((entry) => [entry.bookmarkId, entry.result]));
 
-    store.bookmarks = store.bookmarks.map((bookmark) => {
-      const result = byId.get(bookmark.id);
-      if (!result) return bookmark;
+    const update = db.prepare(`
+      UPDATE bookmarks
+      SET url_status = ?, final_url = ?, http_status_code = ?, checked_at = ?, updated_at = ?
+      WHERE id = ?
+    `);
 
-      return {
-        ...bookmark,
-        status: result.status,
-        finalUrl: result.finalUrl,
-        httpStatusCode: result.statusCode,
-        checkedAt: result.checkedAt,
-        updatedAt: new Date().toISOString()
-      };
+    const tx = db.transaction(() => {
+      for (const { bookmarkId, result } of updates) {
+        update.run(
+          result.status,
+          result.finalUrl,
+          result.statusCode,
+          result.checkedAt,
+          new Date().toISOString(),
+          bookmarkId
+        );
+      }
     });
 
-    await writeStore(store);
+    tx();
   }
 
-  async saveImportRun(input: Omit<ImportRun, "id">): Promise<ImportRun> {
-    const store = await readStore();
-    const run: ImportRun = {
-      id: randomUUID(),
-      ...input
-    };
-    store.imports.push(run);
-    await writeStore(store);
+  async saveImportRun(input: SaveImportRunInput): Promise<ImportRun> {
+    const run = input;
+    db.prepare(
+      `
+      UPDATE imports
+      SET finished_at = ?, duration_ms = ?, total_bookmarks = ?, imported_count = ?,
+          duplicate_count = ?, live_count = ?, redirected_count = ?, dead_count = ?,
+          timeout_count = ?
+      WHERE id = ?
+    `
+    ).run(
+      run.finishedAt,
+      run.durationMs,
+      run.totalBookmarks,
+      run.importedCount,
+      run.duplicateCount,
+      run.liveCount,
+      run.redirectedCount,
+      run.deadCount,
+      run.timeoutCount,
+      run.id
+    );
+
     return run;
   }
 }
