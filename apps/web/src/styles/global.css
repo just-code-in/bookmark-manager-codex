@@ -47,9 +47,84 @@ button:disabled {
 .results {
   display: grid;
   gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.result-card--highlight {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 1px #1d4ed833;
 }
 
 .error {
   color: #b91c1c;
   margin: 0;
+}
+
+.filters {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.filter-button {
+  background: #ffffff;
+  color: #1d4ed8;
+}
+
+.filter-button.active {
+  background: #1d4ed8;
+  color: #ffffff;
+}
+
+.bookmark-card {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.bookmark-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 0.75rem;
+}
+
+.bookmark-url {
+  margin: 0;
+  color: #334155;
+  word-break: break-all;
+}
+
+.status-badge {
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.status-live {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-redirected {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-dead {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.status-untested {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.dead-reason {
+  margin: 0;
+  color: #991b1b;
 }
