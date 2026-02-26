@@ -1,10 +1,15 @@
 node_modules
 .env
 .env.*
+!.env.example
 .DS_Store
 dist
 coverage
 *.log
+Safari Bookmarks*/
+Chrome Bookmarks*/
+*.bookmarks.html
+chrome_bookmarks*.html
 db/*.sqlite
 db/*.sqlite-shm
 db/*.sqlite-wal
