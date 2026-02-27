@@ -4,7 +4,7 @@ Part of the **Built Twice** series. See [PRD.md](./PRD.md) for the shared specif
 
 ## Current status
 
-Import phase is partially implemented:
+Import + triage foundations are implemented:
 
 - `apps/web`: React + Vite UI shell
 - `apps/api`: Fastify API with `POST /imports` multipart upload endpoint
@@ -18,9 +18,15 @@ Implemented so far:
 2. URL-based dedupe across multiple imports using a local repository store.
 3. URL health checks with `live | redirected | dead` classification.
 4. Import summary response with totals and duplicate/status counts.
+5. Triage batch pipeline:
+   - AI-inferred category generation from collection signals
+   - Per-bookmark categorization, 2-5 tags, and 1-2 sentence summaries
+   - Content sourcing for live/redirected URLs and metadata fallback for dead/unsupported URLs
+   - Cache-aware reruns keyed by source hash + prompt/model versions
+   - Run status, progress, category counts, uncategorized reasons, and API token/cost telemetry
 
 ## Next steps
 
-1. Replace JSON repository backend with SQLite.
-2. Add import history/list endpoints in UI.
-3. Add automated tests for parser and URL status classification.
+1. Add retry tooling for failed bookmark fetch/extract cases.
+2. Add integration tests for triage endpoint and caching behavior.
+3. Add category review/edit UX in the web app.

@@ -4,6 +4,7 @@ import Fastify from "fastify";
 
 import { registerHealthRoutes } from "./routes/health";
 import { registerImportRoutes } from "./routes/import";
+import { registerTriageRoutes } from "./routes/triage";
 
 export async function buildApp() {
   const app = Fastify({
@@ -20,6 +21,7 @@ export async function buildApp() {
 
   await registerHealthRoutes(app);
   await registerImportRoutes(app);
+  await registerTriageRoutes(app);
 
   return app;
 }

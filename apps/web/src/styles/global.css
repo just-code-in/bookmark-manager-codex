@@ -29,6 +29,17 @@ body {
   margin: 1.5rem 0;
 }
 
+.triage-controls {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 button {
   width: fit-content;
   padding: 0.5rem 1rem;

@@ -29,9 +29,78 @@ type BookmarkRecord = {
   checkedAt: string | null;
 };
 
+type TriageStatus = {
+  runId: string;
+  status: "running" | "completed" | "failed";
+  stage:
+    | "idle"
+    | "preparing"
+    | "discovering_categories"
+    | "categorizing"
+    | "summarizing"
+    | "finalizing"
+    | "completed"
+    | "failed";
+  startedAt: string;
+  finishedAt: string | null;
+  totalBookmarks: number;
+  processedCount: number;
+  cachedCount: number;
+  categorizedCount: number;
+  uncategorizedCount: number;
+  failedCount: number;
+  apiCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  estimatedCostUsd: number;
+  lastError: string | null;
+};
+
+type TriageCategory = {
+  category: string;
+  count: number;
+};
+
+type TriageUncategorized = {
+  bookmarkId: string;
+  title: string;
+  url: string;
+  reasonCode: string;
+};
+
+type TriageSummary = {
+  run: {
+    id: string;
+    status: "running" | "completed" | "failed";
+    startedAt: string;
+    finishedAt: string | null;
+    durationMs: number;
+    totalBookmarks: number;
+    processedCount: number;
+    cachedCount: number;
+    categorizedCount: number;
+    uncategorizedCount: number;
+    failedCount: number;
+    categoryModel: string;
+    summaryModel: string;
+    promptVersion: string;
+    apiCalls: number;
+    promptTokens: number;
+    completionTokens: number;
+    estimatedCostUsd: number;
+    errorMessage: string | null;
+  };
+  categories: TriageCategory[];
+  uncategorized: TriageUncategorized[];
+};
+
 function formatStatusLabel(status: BookmarkStatus) {
   if (status === "redirected") return "redirect";
   return status;
+}
+
+function formatTriageStage(stage: TriageStatus["stage"]): string {
+  return stage.replaceAll("_", " ");
 }
 
 function deadReason(bookmark: BookmarkRecord): string {
@@ -40,14 +109,22 @@ function deadReason(bookmark: BookmarkRecord): string {
   return "No HTTP response (timeout or connection refused)";
 }
 
+function formatUsd(value: number): string {
+  return `$${value.toFixed(4)}`;
+}
+
 export function App() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingBookmarks, setLoadingBookmarks] = useState(false);
+  const [runningTriage, setRunningTriage] = useState(false);
+  const [ignoreCache, setIgnoreCache] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<ImportSummary[]>([]);
   const [bookmarks, setBookmarks] = useState<BookmarkRecord[]>([]);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [triageStatus, setTriageStatus] = useState<TriageStatus | null>(null);
+  const [triageSummary, setTriageSummary] = useState<TriageSummary | null>(null);
 
   const latestImport = useMemo(() => results[0] ?? null, [results]);
 
@@ -74,11 +151,35 @@ export function App() {
     }
   }
 
+  async function loadTriageStatus() {
+    const response = await fetch("http://127.0.0.1:4040/triage/status");
+    if (!response.ok) {
+      throw new Error("Failed to load triage status.");
+    }
+    const payload = (await response.json()) as { status: TriageStatus | null };
+    setTriageStatus(payload.status);
+    setRunningTriage(payload.status?.status === "running");
+  }
+
+  async function loadTriageSummary() {
+    const response = await fetch("http://127.0.0.1:4040/triage/runs/latest");
+    if (!response.ok) {
+      throw new Error("Failed to load triage summary.");
+    }
+    const payload = (await response.json()) as { summary: TriageSummary | null };
+    setTriageSummary(payload.summary);
+  }
+
   useEffect(() => {
     async function loadInitial() {
       try {
         setError(null);
-        await Promise.all([loadImportResults(), loadBookmarks(statusFilter)]);
+        await Promise.all([
+          loadImportResults(),
+          loadBookmarks(statusFilter),
+          loadTriageStatus(),
+          loadTriageSummary()
+        ]);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load data.");
       }
@@ -97,6 +198,23 @@ export function App() {
     }
     void refreshBookmarksForFilter();
   }, [statusFilter]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void (async () => {
+        try {
+          await loadTriageStatus();
+          if (runningTriage) {
+            await loadTriageSummary();
+          }
+        } catch {
+          // Keep polling; surface API failures in explicit actions.
+        }
+      })();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [runningTriage]);
 
   async function handleImport() {
     if (!file) {
@@ -133,6 +251,35 @@ export function App() {
     }
   }
 
+  async function handleStartTriage() {
+    setError(null);
+    setRunningTriage(true);
+
+    try {
+      const response = await fetch("http://127.0.0.1:4040/triage/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ignoreCache })
+      });
+
+      if (!response.ok && response.status !== 409) {
+        const payload = (await response.json()) as { error?: string };
+        throw new Error(payload.error ?? "Failed to start triage run.");
+      }
+
+      await loadTriageStatus();
+      await loadTriageSummary();
+    } catch (err) {
+      setRunningTriage(false);
+      setError(err instanceof Error ? err.message : "Failed to start triage run.");
+    }
+  }
+
+  const progressPct =
+    triageStatus && triageStatus.totalBookmarks > 0
+      ? Math.min(100, Math.round((triageStatus.processedCount / triageStatus.totalBookmarks) * 100))
+      : 0;
+
   return (
     <main className="app-shell">
       <h1>Bookmark Manager</h1>
@@ -148,6 +295,91 @@ export function App() {
           {loading ? "Importing..." : "Run Import"}
         </button>
         {error ? <p className="error">{error}</p> : null}
+      </section>
+
+      <section className="results">
+        <h2>Triage</h2>
+        <article className="result-card">
+          <div className="triage-controls">
+            <button
+              type="button"
+              onClick={handleStartTriage}
+              disabled={runningTriage || bookmarks.length === 0}
+            >
+              {runningTriage ? "Triage Running..." : "Run Triage"}
+            </button>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={ignoreCache}
+                onChange={(event) => setIgnoreCache(event.currentTarget.checked)}
+                disabled={runningTriage}
+              />
+              Ignore cache and reprocess all bookmarks
+            </label>
+          </div>
+          {triageStatus ? (
+            <>
+              <p>
+                <strong>Stage:</strong> {formatTriageStage(triageStatus.stage)}
+              </p>
+              <p>
+                <strong>Progress:</strong> {triageStatus.processedCount} / {triageStatus.totalBookmarks} ({progressPct}%)
+              </p>
+              <p>
+                <strong>Cache hits:</strong> {triageStatus.cachedCount} | <strong>Categorized:</strong>{" "}
+                {triageStatus.categorizedCount} | <strong>Uncategorized:</strong>{" "}
+                {triageStatus.uncategorizedCount}
+              </p>
+              <p>
+                <strong>API calls:</strong> {triageStatus.apiCalls} | <strong>Prompt tokens:</strong>{" "}
+                {triageStatus.promptTokens} | <strong>Completion tokens:</strong>{" "}
+                {triageStatus.completionTokens}
+              </p>
+              <p>
+                <strong>Estimated cost:</strong> {formatUsd(triageStatus.estimatedCostUsd)}
+              </p>
+              {triageStatus.lastError ? (
+                <p className="error">
+                  <strong>Last error:</strong> {triageStatus.lastError}
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <p>No triage run yet.</p>
+          )}
+        </article>
+
+        {triageSummary ? (
+          <article className="result-card">
+            <p>
+              <strong>Latest run:</strong> {triageSummary.run.id}
+            </p>
+            <p>
+              <strong>Status:</strong> {triageSummary.run.status} | <strong>Duration:</strong>{" "}
+              {triageSummary.run.durationMs}ms
+            </p>
+            <p>
+              <strong>Models:</strong> {triageSummary.run.categoryModel} (categorization),{" "}
+              {triageSummary.run.summaryModel} (summary)
+            </p>
+            <h3>Categories</h3>
+            {triageSummary.categories.length === 0 ? <p>No categories generated yet.</p> : null}
+            {triageSummary.categories.map((item) => (
+              <p key={item.category}>
+                <strong>{item.category}:</strong> {item.count}
+              </p>
+            ))}
+
+            <h3>Couldn&apos;t Categorize</h3>
+            {triageSummary.uncategorized.length === 0 ? <p>None.</p> : null}
+            {triageSummary.uncategorized.slice(0, 20).map((item) => (
+              <p key={item.bookmarkId}>
+                <strong>{item.title}</strong> ({item.reasonCode})
+              </p>
+            ))}
+          </article>
+        ) : null}
       </section>
 
       <section className="results">
@@ -179,12 +411,12 @@ export function App() {
               <strong>Source:</strong> {result.source} | <strong>File:</strong> {result.fileName}
             </p>
             <p>
-              <strong>Total:</strong> {result.total} | <strong>Imported:</strong>{" "}
-              {result.imported} | <strong>Duplicates:</strong> {result.duplicates}
+              <strong>Total:</strong> {result.total} | <strong>Imported:</strong> {result.imported} |{" "}
+              <strong>Duplicates:</strong> {result.duplicates}
             </p>
             <p>
-              <strong>Live:</strong> {result.live} | <strong>Redirected:</strong>{" "}
-              {result.redirected} | <strong>Dead:</strong> {result.dead}
+              <strong>Live:</strong> {result.live} | <strong>Redirected:</strong> {result.redirected} |{" "}
+              <strong>Dead:</strong> {result.dead}
             </p>
             <p>
               <strong>Timed Out:</strong> {result.timedOut} | <strong>Duration:</strong>{" "}
