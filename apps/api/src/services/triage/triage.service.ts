@@ -6,6 +6,8 @@ import {
   type UncategorizedReason,
   TriageRepository
 } from "../../repositories/triage.repository";
+import { OrganizationRepository } from "../../repositories/organization.repository";
+import { SearchService } from "../search/search.service";
 
 type Stage =
   | "idle"
@@ -21,6 +23,8 @@ type RunStatus = "running" | "completed" | "failed";
 
 type StartRunInput = {
   ignoreCache?: boolean;
+  limit?: number;
+  bookmarkIds?: string[];
 };
 
 type CollectionSummary = {
@@ -73,6 +77,7 @@ type RuntimeStatus = {
   startedAt: string;
   finishedAt: string | null;
   totalBookmarks: number;
+  preparedCount: number;
   processedCount: number;
   cachedCount: number;
   categorizedCount: number;
@@ -81,6 +86,8 @@ type RuntimeStatus = {
   apiCalls: number;
   promptTokens: number;
   completionTokens: number;
+  missingOutputRetriesAttempted: number;
+  missingOutputRetriesRecovered: number;
   estimatedCostUsd: number;
   lastError: string | null;
 };
@@ -104,6 +111,8 @@ type RunResultSummary = {
     apiCalls: number;
     promptTokens: number;
     completionTokens: number;
+    missingOutputRetriesAttempted: number;
+    missingOutputRetriesRecovered: number;
     estimatedCostUsd: number;
     errorMessage: string | null;
   };
@@ -116,8 +125,8 @@ type ModelPrice = {
   outputUsdPer1m: number;
 };
 
-const PROMPT_VERSION = "triage-v1";
-const CATEGORY_MODEL = process.env.TRIAGE_CATEGORY_MODEL ?? "gpt-4.1-nano";
+const PROMPT_VERSION = "triage-v2";
+const CATEGORY_MODEL = process.env.TRIAGE_CATEGORY_MODEL ?? "gpt-4.1-mini";
 const SUMMARY_MODEL = process.env.TRIAGE_SUMMARY_MODEL ?? "gpt-4.1-mini";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -126,8 +135,37 @@ const MODEL_PRICES: Record<string, ModelPrice> = {
   "gpt-4.1-mini": { inputUsdPer1m: 0.4, outputUsdPer1m: 1.6 }
 };
 
-const CATEGORY_BATCH_SIZE = 24;
-const SUMMARY_BATCH_SIZE = 16;
+const CATEGORY_BATCH_SIZE = Number(process.env.TRIAGE_CATEGORY_BATCH_SIZE ?? 12);
+const SUMMARY_BATCH_SIZE = Number(process.env.TRIAGE_SUMMARY_BATCH_SIZE ?? 12);
+const PREPARE_CONCURRENCY = Number(process.env.TRIAGE_PREPARE_CONCURRENCY ?? 12);
+const FETCH_TIMEOUT_MS = Number(process.env.TRIAGE_FETCH_TIMEOUT_MS ?? 5_000);
+const MISSING_OUTPUT_RETRY_ATTEMPTS = Number(process.env.TRIAGE_MISSING_OUTPUT_RETRY_ATTEMPTS ?? 2);
+const MISSING_OUTPUT_RETRY_BATCH_SIZE = Number(process.env.TRIAGE_MISSING_OUTPUT_RETRY_BATCH_SIZE ?? 4);
+const TRIAGE_DEBUG = process.env.TRIAGE_DEBUG === "1";
+const NON_CACHEABLE_REASON_CODES = new Set([
+  "categorization_failed",
+  "missing_model_output",
+  "missing_model_output_after_retries"
+]);
+const SECOND_PASS_FALLBACK_CATEGORIES = [
+  "Alumni & Institutions",
+  "Health & Medical",
+  "Automotive",
+  "Public Data & Maps",
+  "Docs & Spreadsheets",
+  "URL Shorteners & Redirectors"
+] as const;
+const GENERIC_CATEGORY_NAMES = new Set([
+  "learning",
+  "tools",
+  "news",
+  "reference",
+  "other",
+  "misc",
+  "miscellaneous",
+  "general",
+  "resources"
+]);
 
 function chunk<T>(items: T[], size: number): T[][] {
   const batches: T[][] = [];
@@ -137,7 +175,8 @@ function chunk<T>(items: T[], size: number): T[][] {
   return batches;
 }
 
-function normalizeWhitespace(input: string): string {
+function normalizeWhitespace(input: unknown): string {
+  if (typeof input !== "string") return "";
   return input.replace(/\s+/g, " ").trim();
 }
 
@@ -169,6 +208,118 @@ function parseJson<T>(raw: string): T {
   return JSON.parse(raw) as T;
 }
 
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function pickFirstArray(obj: Record<string, unknown>, keys: string[]): unknown[] | null {
+  for (const key of keys) {
+    const value = obj[key];
+    if (Array.isArray(value)) return value;
+  }
+  return null;
+}
+
+function parseDiscoveredCategories(data: unknown): string[] {
+  const obj = asObject(data);
+  const categories = obj?.categories;
+  if (!Array.isArray(categories)) {
+    throw new Error("Malformed category discovery response: expected data.categories to be an array.");
+  }
+
+  return categories
+    .map((entry) => normalizeWhitespace(asObject(entry)?.name))
+    .filter((entry) => entry.length > 0)
+    .slice(0, 16);
+}
+
+function parseCategorizationItems(data: unknown): CategoryResult[] {
+  const obj = asObject(data);
+  const items = obj
+    ? pickFirstArray(obj, ["items", "results", "assignments", "bookmarks", "categories"])
+    : null;
+  if (!items) {
+    const keys = obj ? Object.keys(obj).slice(0, 8).join(", ") : "non-object";
+    throw new Error(
+      `Malformed categorization response: expected an array under one of [items, results, assignments, bookmarks, categories]. Keys found: ${keys}`
+    );
+  }
+
+  return items.map((entry, index) => {
+    const item = asObject(entry);
+    const id = normalizeWhitespace(item?.id);
+    if (!id) {
+      throw new Error(`Malformed categorization response: items[${index}].id is missing or not a string.`);
+    }
+
+    const categoryRaw = item?.category;
+    const category = typeof categoryRaw === "string" ? categoryRaw : null;
+    const tagsRaw = item?.tags;
+    const tags =
+      Array.isArray(tagsRaw) ? tagsRaw.map((tag) => normalizeWhitespace(tag)).filter(Boolean) : [];
+    const confidenceRaw = item?.confidence;
+    const confidence =
+      typeof confidenceRaw === "number" && Number.isFinite(confidenceRaw) ? confidenceRaw : null;
+    const reasonCodeRaw = item?.reasonCode;
+    const reasonCode = typeof reasonCodeRaw === "string" ? reasonCodeRaw : null;
+
+    return {
+      id,
+      category,
+      tags,
+      confidence,
+      reasonCode
+    };
+  });
+}
+
+function parseSummaryItems(data: unknown): SummaryResult[] {
+  const obj = asObject(data);
+  const items = obj ? pickFirstArray(obj, ["items", "results", "summaries", "bookmarks"]) : null;
+  if (!items) {
+    const keys = obj ? Object.keys(obj).slice(0, 8).join(", ") : "non-object";
+    throw new Error(
+      `Malformed summary response: expected an array under one of [items, results, summaries, bookmarks]. Keys found: ${keys}`
+    );
+  }
+
+  return items.map((entry, index) => {
+    const item = asObject(entry);
+    const id = normalizeWhitespace(item?.id);
+    if (!id) {
+      throw new Error(`Malformed summary response: items[${index}].id is missing or not a string.`);
+    }
+    const summary = normalizeWhitespace(item?.summary);
+    return { id, summary };
+  });
+}
+
+function isGenericCategory(name: string): boolean {
+  const normalized = normalizeWhitespace(name).toLowerCase();
+  return GENERIC_CATEGORY_NAMES.has(normalized);
+}
+
+function normalizeReasonCode(input: unknown): string | null {
+  const raw = normalizeWhitespace(input).toLowerCase();
+  if (!raw) return null;
+  const compact = raw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+  if (compact.includes("dead") && compact.includes("link")) return "dead_link";
+  if (compact.includes("unsupported") && compact.includes("url")) return "unsupported_url";
+  if (compact.includes("unlisted") && compact.includes("category")) return "unlisted_category";
+  if (compact.includes("no_matching") && compact.includes("category")) return "no_matching_category";
+  if (compact.includes("unclear") && compact.includes("category")) return "unclear_category";
+  if (compact.includes("insufficient") && compact.includes("information")) return "insufficient_information";
+  if (compact.includes("uncategorizable") && compact.includes("content")) return "uncategorizable_content";
+  if (compact === "categorization_failed") return "categorization_failed";
+  if (compact === "missing_model_output") return "missing_model_output";
+  if (compact === "missing_model_output_after_retries") return "missing_model_output_after_retries";
+  if (compact === "not_enough_signal") return "not_enough_signal";
+
+  return compact;
+}
+
 async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
   const queue = [...items];
   const runners = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, async () => {
@@ -183,6 +334,8 @@ async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T
 
 export class TriageService {
   private readonly repository = new TriageRepository();
+  private readonly organizationRepository = new OrganizationRepository();
+  private readonly searchService = new SearchService();
   private activeStatus: RuntimeStatus | null = null;
 
   async startRun(input: StartRunInput): Promise<{ runId: string; alreadyRunning: boolean }> {
@@ -190,7 +343,15 @@ export class TriageService {
       return { runId: this.activeStatus.runId, alreadyRunning: true };
     }
 
-    const bookmarks = await this.repository.listBookmarksForTriage();
+    const allBookmarks = await this.repository.listBookmarksForTriage(input.bookmarkIds);
+    const requestedLimit =
+      typeof input.limit === "number" && Number.isFinite(input.limit)
+        ? Math.max(1, Math.floor(input.limit))
+        : null;
+    const bookmarks =
+      requestedLimit && requestedLimit < allBookmarks.length
+        ? allBookmarks.slice(0, requestedLimit)
+        : allBookmarks;
     const runId = randomUUID();
     const startedAt = new Date().toISOString();
 
@@ -210,6 +371,7 @@ export class TriageService {
       startedAt,
       finishedAt: null,
       totalBookmarks: bookmarks.length,
+      preparedCount: 0,
       processedCount: 0,
       cachedCount: 0,
       categorizedCount: 0,
@@ -218,6 +380,8 @@ export class TriageService {
       apiCalls: 0,
       promptTokens: 0,
       completionTokens: 0,
+      missingOutputRetriesAttempted: 0,
+      missingOutputRetriesRecovered: 0,
       estimatedCostUsd: 0,
       lastError: null
     };
@@ -239,6 +403,7 @@ export class TriageService {
       startedAt: latest.startedAt,
       finishedAt: latest.finishedAt,
       totalBookmarks: latest.totalBookmarks,
+      preparedCount: latest.status === "running" ? latest.processedCount : latest.totalBookmarks,
       processedCount: latest.processedCount,
       cachedCount: latest.cachedCount,
       categorizedCount: latest.categorizedCount,
@@ -247,6 +412,8 @@ export class TriageService {
       apiCalls: latest.apiCalls,
       promptTokens: latest.promptTokens,
       completionTokens: latest.completionTokens,
+      missingOutputRetriesAttempted: latest.missingOutputRetriesAttempted,
+      missingOutputRetriesRecovered: latest.missingOutputRetriesRecovered,
       estimatedCostUsd: latest.estimatedCostUsd,
       lastError: latest.errorMessage
     };
@@ -308,7 +475,8 @@ export class TriageService {
           cached.sourceHash === bookmark.sourceHash &&
           cached.categoryModel === CATEGORY_MODEL &&
           cached.summaryModel === SUMMARY_MODEL &&
-          cached.promptVersion === PROMPT_VERSION;
+          cached.promptVersion === PROMPT_VERSION &&
+          !NON_CACHEABLE_REASON_CODES.has(cached.reasonCode ?? "");
 
         if (cacheValid && cached) {
           cacheRows.push({
@@ -392,8 +560,25 @@ export class TriageService {
         apiCalls: this.activeStatus?.apiCalls ?? 0,
         promptTokens: this.activeStatus?.promptTokens ?? 0,
         completionTokens: this.activeStatus?.completionTokens ?? 0,
+        missingOutputRetriesAttempted: this.activeStatus?.missingOutputRetriesAttempted ?? 0,
+        missingOutputRetriesRecovered: this.activeStatus?.missingOutputRetriesRecovered ?? 0,
         estimatedCostUsd: this.activeStatus?.estimatedCostUsd ?? 0
       });
+
+      await this.organizationRepository.syncFromTriage(
+        bookmarks.map((bookmark) => bookmark.id),
+        true
+      );
+      try {
+        await this.searchService.syncEmbeddings({ bookmarkIds: bookmarks.map((bookmark) => bookmark.id) });
+      } catch (embeddingError) {
+        if (this.activeStatus) {
+          this.activeStatus.lastError =
+            embeddingError instanceof Error
+              ? `Embeddings were not updated: ${embeddingError.message}`
+              : "Embeddings were not updated.";
+        }
+      }
 
       if (this.activeStatus) {
         this.activeStatus.status = "completed";
@@ -417,6 +602,8 @@ export class TriageService {
         apiCalls: this.activeStatus?.apiCalls ?? 0,
         promptTokens: this.activeStatus?.promptTokens ?? 0,
         completionTokens: this.activeStatus?.completionTokens ?? 0,
+        missingOutputRetriesAttempted: this.activeStatus?.missingOutputRetriesAttempted ?? 0,
+        missingOutputRetriesRecovered: this.activeStatus?.missingOutputRetriesRecovered ?? 0,
         estimatedCostUsd: this.activeStatus?.estimatedCostUsd ?? 0,
         errorMessage: message
       });
@@ -435,7 +622,7 @@ export class TriageService {
     this.setStage("preparing");
     const prepared: PreparedBookmark[] = [];
 
-    await runWithConcurrency(bookmarks, 6, async (bookmark) => {
+    await runWithConcurrency(bookmarks, PREPARE_CONCURRENCY, async (bookmark) => {
       const sourceType = this.resolveSourceType(bookmark);
       const targetUrl = bookmark.status === "redirected" ? bookmark.finalUrl ?? bookmark.url : bookmark.url;
 
@@ -455,6 +642,8 @@ export class TriageService {
         excerpt,
         sourceHash
       });
+
+      this.bumpPrepared();
     });
 
     return prepared;
@@ -501,9 +690,10 @@ export class TriageService {
       apiKey,
       model: CATEGORY_MODEL,
       systemPrompt:
-        "You are categorizing a personal bookmark collection. Infer sensible high-level categories from the collection itself, with no predefined taxonomy.",
+        "You are categorizing a personal bookmark collection. Infer practical, specific themes from the collection itself.",
       userPrompt: JSON.stringify({
-        task: "Return 8 to 16 category names only. Keep names concise.",
+        task:
+          "Return 10 to 18 specific category names only. Avoid generic labels like Learning, Tools, News, Reference, General, Other, Misc. Prefer concrete themes such as 'AI Research Assistants', 'Developer Infrastructure', 'Government Services', 'Travel Logistics', 'Finance & Investing'.",
         collection: summary
       }),
       temperature: 0.2
@@ -511,16 +701,22 @@ export class TriageService {
 
     this.recordUsage(CATEGORY_MODEL, response.usage);
 
-    const categories = response.data.categories
-      .map((entry) => normalizeWhitespace(entry.name))
-      .filter((entry) => entry.length > 0)
-      .slice(0, 16);
+    const categories = parseDiscoveredCategories(response.data).filter((name) => !isGenericCategory(name));
 
     if (categories.length > 0) {
       return categories;
     }
 
-    return ["Reference", "Engineering", "Learning", "News", "Tools", "Entertainment"];
+    return [
+      "AI Research Assistants",
+      "Developer Infrastructure",
+      "Government Services",
+      "Finance & Investing",
+      "Travel & Transportation",
+      "Productivity Workflows",
+      "Media & Entertainment",
+      "Legal & Compliance"
+    ];
   }
 
   private async runCategorization(
@@ -529,7 +725,10 @@ export class TriageService {
     bookmarks: PreparedBookmark[]
   ): Promise<Map<string, CategoryResult>> {
     const results = new Map<string, CategoryResult>();
+    const allowedCategories = Array.from(new Set([...categories, ...SECOND_PASS_FALLBACK_CATEGORIES]));
     const batches = chunk(bookmarks, CATEGORY_BATCH_SIZE);
+    let successfulBatches = 0;
+    let lastBatchError: string | null = null;
 
     for (const batch of batches) {
       const payload = {
@@ -550,25 +749,78 @@ export class TriageService {
           apiKey,
           model: CATEGORY_MODEL,
           systemPrompt:
-            "Assign one category from the provided list, 2-5 descriptive tags, and a reason code when uncategorizable. Return strict JSON.",
+            "Assign one category from the provided list, 2-5 descriptive tags, and a reason code when uncategorizable. For dead or unsupported URLs, infer category from title, URL, and folder path metadata whenever possible. Return strict JSON using this top-level shape: {\"items\":[{\"id\":\"...\",\"category\":\"...|null\",\"tags\":[\"...\"],\"confidence\":0.0,\"reasonCode\":\"...|null\"}]}. Include exactly one item for every input bookmark id.",
           userPrompt: JSON.stringify(payload),
           temperature: 0.1
         });
 
         this.recordUsage(CATEGORY_MODEL, response.usage);
+        const items = parseCategorizationItems(response.data);
+        successfulBatches += 1;
 
-        const byId = new Map(response.data.items.map((item) => [item.id, item]));
+        const byId = new Map(items.map((item) => [item.id, item]));
+        const missing = batch.filter((bookmark) => !byId.has(bookmark.id));
+        if (missing.length > 0) {
+          this.bumpMissingOutputRetries({ attempted: missing.length });
+          const recovered = await this.retryMissingCategorization(apiKey, categories, missing);
+          this.bumpMissingOutputRetries({ recovered: recovered.size });
+          for (const item of recovered.values()) {
+            byId.set(item.id, item);
+          }
+          if (TRIAGE_DEBUG) {
+            console.info(
+              `[triage ${this.activeStatus?.runId ?? "unknown"}] categorization missing output: batch=${batch.length} missing=${missing.length} recovered=${recovered.size}`
+            );
+          }
+        }
+
+        const finalById = new Map<string, CategoryResult>();
         for (const bookmark of batch) {
           const assigned = byId.get(bookmark.id);
-          const normalized = this.normalizeCategoryResult(assigned, categories);
-          results.set(bookmark.id, normalized);
+          const normalized = this.normalizeCategoryResult(assigned, allowedCategories);
+          const deterministic = this.applyDeterministicCategorization(bookmark, allowedCategories);
+          finalById.set(bookmark.id, deterministic ?? normalized);
+        }
+
+        const unresolved = batch.filter((bookmark) => {
+          const current = finalById.get(bookmark.id);
+          return !current?.category;
+        });
+
+        if (unresolved.length > 0) {
+          const secondPass = await this.resolveUncategorizedSecondPass(
+            apiKey,
+            allowedCategories,
+            unresolved,
+            finalById
+          );
+          for (const [id, resolved] of secondPass.entries()) {
+            finalById.set(id, resolved);
+          }
+        }
+
+        for (const bookmark of batch) {
+          const final = finalById.get(bookmark.id) ?? {
+            id: bookmark.id,
+            category: null,
+            tags: [],
+            confidence: null,
+            reasonCode: "missing_model_output_after_retries"
+          };
+          results.set(bookmark.id, final);
           this.bumpCounts({
             processed: 1,
-            categorized: normalized.category ? 1 : 0,
-            uncategorized: normalized.category ? 0 : 1
+            categorized: final.category ? 1 : 0,
+            uncategorized: final.category ? 0 : 1
           });
         }
-      } catch {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown categorization batch error";
+        lastBatchError = message;
+        if (TRIAGE_DEBUG) {
+          console.warn(`[triage ${this.activeStatus?.runId ?? "unknown"}] categorization batch failed: ${message}`);
+        }
+
         for (const bookmark of batch) {
           results.set(bookmark.id, {
             id: bookmark.id,
@@ -582,6 +834,12 @@ export class TriageService {
       }
 
       await this.persistProgress(this.activeStatus?.runId ?? "");
+    }
+
+    if (batches.length > 0 && successfulBatches === 0) {
+      throw new Error(
+        `All categorization batches failed. Last error: ${(lastBatchError ?? "unknown error").slice(0, 220)}`
+      );
     }
 
     return results;
@@ -608,6 +866,8 @@ export class TriageService {
 
     const pending = bookmarks.filter((bookmark) => !summaries.has(bookmark.id));
     const batches = chunk(pending, SUMMARY_BATCH_SIZE);
+    let successfulBatches = 0;
+    let lastBatchError: string | null = null;
 
     for (const batch of batches) {
       const payload = {
@@ -628,19 +888,42 @@ export class TriageService {
           apiKey,
           model: SUMMARY_MODEL,
           systemPrompt:
-            "Write concise 1-2 sentence summaries for bookmarks using the supplied excerpt and metadata. Return strict JSON.",
+            "Write concise 1-2 sentence summaries for bookmarks using the supplied excerpt and metadata. Return strict JSON using this top-level shape: {\"items\":[{\"id\":\"...\",\"summary\":\"...\"}]}",
           userPrompt: JSON.stringify(payload),
           temperature: 0.2
         });
 
         this.recordUsage(SUMMARY_MODEL, response.usage);
+        const items = parseSummaryItems(response.data);
+        successfulBatches += 1;
 
-        const byId = new Map(response.data.items.map((item) => [item.id, item.summary]));
+        const byId = new Map(items.map((item) => [item.id, item.summary]));
+        const missing = batch.filter((bookmark) => !byId.has(bookmark.id));
+        if (missing.length > 0) {
+          this.bumpMissingOutputRetries({ attempted: missing.length });
+          const recovered = await this.retryMissingSummaries(apiKey, missing, assignments);
+          this.bumpMissingOutputRetries({ recovered: recovered.size });
+          for (const [id, summary] of recovered.entries()) {
+            byId.set(id, summary);
+          }
+          if (TRIAGE_DEBUG) {
+            console.info(
+              `[triage ${this.activeStatus?.runId ?? "unknown"}] summary missing output: batch=${batch.length} missing=${missing.length} recovered=${recovered.size}`
+            );
+          }
+        }
+
         for (const bookmark of batch) {
           const summary = byId.get(bookmark.id);
           summaries.set(bookmark.id, this.normalizeSummary(summary, bookmark));
         }
-      } catch {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown summary batch error";
+        lastBatchError = message;
+        if (TRIAGE_DEBUG) {
+          console.warn(`[triage ${this.activeStatus?.runId ?? "unknown"}] summary batch failed: ${message}`);
+        }
+
         for (const bookmark of batch) {
           summaries.set(bookmark.id, this.localFallbackSummary(bookmark));
           this.bumpCounts({ failed: 1 });
@@ -648,6 +931,12 @@ export class TriageService {
       }
 
       await this.persistProgress(this.activeStatus?.runId ?? "");
+    }
+
+    if (batches.length > 0 && successfulBatches === 0) {
+      throw new Error(
+        `All summary batches failed. Last error: ${(lastBatchError ?? "unknown error").slice(0, 220)}`
+      );
     }
 
     return summaries;
@@ -663,7 +952,7 @@ export class TriageService {
         category: null,
         tags: [],
         confidence: null,
-        reasonCode: "missing_model_output"
+        reasonCode: "missing_model_output_after_retries"
       };
     }
 
@@ -684,8 +973,111 @@ export class TriageService {
       category,
       tags,
       confidence,
-      reasonCode: category ? null : item.reasonCode ?? "not_enough_signal"
+      reasonCode: category ? null : normalizeReasonCode(item.reasonCode) || "not_enough_signal"
     };
+  }
+
+  private applyDeterministicCategorization(
+    bookmark: PreparedBookmark,
+    categories: string[]
+  ): CategoryResult | null {
+    const domain = extractDomain(bookmark.targetUrl);
+    if (
+      (domain === "docs.google.com" || domain === "drive.google.com") &&
+      categories.includes("Productivity Workflows")
+    ) {
+      return {
+        id: bookmark.id,
+        category: "Productivity Workflows",
+        tags: ["documents", "spreadsheets", "workspace"],
+        confidence: 0.75,
+        reasonCode: null
+      };
+    }
+
+    if (["bit.ly", "t.co", "tinyurl.com", "ow.ly"].includes(domain)) {
+      if (categories.includes("URL Shorteners & Redirectors")) {
+        return {
+          id: bookmark.id,
+          category: "URL Shorteners & Redirectors",
+          tags: ["shortener", "redirect"],
+          confidence: 0.8,
+          reasonCode: null
+        };
+      }
+
+      return {
+        id: bookmark.id,
+        category: null,
+        tags: [],
+        confidence: null,
+        reasonCode: "uncategorizable_content"
+      };
+    }
+
+    return null;
+  }
+
+  private async resolveUncategorizedSecondPass(
+    apiKey: string,
+    categories: string[],
+    unresolved: PreparedBookmark[],
+    current: Map<string, CategoryResult>
+  ): Promise<Map<string, CategoryResult>> {
+    const resolved = new Map<string, CategoryResult>();
+    const batches = chunk(unresolved, MISSING_OUTPUT_RETRY_BATCH_SIZE);
+
+    for (const batch of batches) {
+      try {
+        const response = await this.callOpenAiJson<{ items: CategoryResult[] }>({
+          apiKey,
+          model: CATEGORY_MODEL,
+          systemPrompt:
+            "You are resolving uncategorized bookmarks. Choose exactly one category from the provided list; use null only when truly impossible. For dead or unsupported URLs, infer category from title, URL, and folder metadata.",
+          userPrompt: JSON.stringify({
+            categories,
+            task: "Resolve uncategorized bookmarks. Return strict JSON {\"items\":[...]} with one item per id.",
+            bookmarks: batch.map((bookmark) => ({
+              id: bookmark.id,
+              title: bookmark.title,
+              url: bookmark.url,
+              folderPath: bookmark.folderPath,
+              sourceType: bookmark.sourceType,
+              excerpt: bookmark.excerpt.slice(0, 1200),
+              currentReason: current.get(bookmark.id)?.reasonCode ?? null
+            }))
+          }),
+          temperature: 0
+        });
+
+        this.recordUsage(CATEGORY_MODEL, response.usage);
+        const items = parseCategorizationItems(response.data);
+        const byId = new Map(items.map((item) => [item.id, item]));
+
+        for (const bookmark of batch) {
+          const candidate = byId.get(bookmark.id);
+          if (!candidate) continue;
+          const normalized = this.normalizeCategoryResult(candidate, categories);
+          if (normalized.category) {
+            resolved.set(bookmark.id, normalized);
+          } else {
+            resolved.set(bookmark.id, {
+              ...normalized,
+              reasonCode: normalizeReasonCode(normalized.reasonCode) ?? "insufficient_information"
+            });
+          }
+        }
+      } catch (error) {
+        if (TRIAGE_DEBUG) {
+          const message = error instanceof Error ? error.message : "Unknown second-pass error";
+          console.warn(
+            `[triage ${this.activeStatus?.runId ?? "unknown"}] second-pass resolver failed: ${message}`
+          );
+        }
+      }
+    }
+
+    return resolved;
   }
 
   private normalizeSummary(rawSummary: string | undefined, bookmark: PreparedBookmark): string {
@@ -726,7 +1118,7 @@ export class TriageService {
 
   private async fetchPageExcerpt(url: string): Promise<string> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
       const response = await fetch(url, {
@@ -775,8 +1167,8 @@ export class TriageService {
         temperature: input.temperature,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: input.systemPrompt },
-          { role: "user", content: input.userPrompt }
+          { role: "system", content: `${input.systemPrompt} Always respond with valid JSON.` },
+          { role: "user", content: `${input.userPrompt}\n\nReturn only a JSON object.` }
         ]
       })
     });
@@ -805,6 +1197,132 @@ export class TriageService {
     };
   }
 
+  private async retryMissingCategorization(
+    apiKey: string,
+    categories: string[],
+    missing: PreparedBookmark[]
+  ): Promise<Map<string, CategoryResult>> {
+    const recovered = new Map<string, CategoryResult>();
+    let remaining = [...missing];
+
+    for (let attempt = 1; attempt <= MISSING_OUTPUT_RETRY_ATTEMPTS && remaining.length > 0; attempt += 1) {
+      const batches = chunk(remaining, MISSING_OUTPUT_RETRY_BATCH_SIZE);
+      const nextRemaining: PreparedBookmark[] = [];
+
+      for (const batch of batches) {
+        try {
+          const response = await this.callOpenAiJson<{ items: CategoryResult[] }>({
+            apiKey,
+            model: CATEGORY_MODEL,
+            systemPrompt:
+              "You are retrying missing classification outputs. Return strict JSON as {\"items\":[...]} with exactly one item for every bookmark id and no omissions.",
+            userPrompt: JSON.stringify({
+              categories,
+              bookmarks: batch.map((bookmark) => ({
+                id: bookmark.id,
+                title: bookmark.title,
+                url: bookmark.url,
+                finalUrl: bookmark.finalUrl,
+                folderPath: bookmark.folderPath,
+                sourceType: bookmark.sourceType,
+                excerpt: bookmark.excerpt.slice(0, 1000)
+              }))
+            }),
+            temperature: 0
+          });
+
+          this.recordUsage(CATEGORY_MODEL, response.usage);
+          const items = parseCategorizationItems(response.data);
+          const byId = new Map(items.map((item) => [item.id, item]));
+
+          for (const bookmark of batch) {
+            const item = byId.get(bookmark.id);
+            if (item) {
+              recovered.set(bookmark.id, item);
+            } else {
+              nextRemaining.push(bookmark);
+            }
+          }
+        } catch (error) {
+          if (TRIAGE_DEBUG) {
+            const message = error instanceof Error ? error.message : "Unknown retry error";
+            console.warn(
+              `[triage ${this.activeStatus?.runId ?? "unknown"}] categorization retry attempt ${attempt} failed: ${message}`
+            );
+          }
+          nextRemaining.push(...batch);
+        }
+      }
+
+      remaining = nextRemaining;
+    }
+
+    return recovered;
+  }
+
+  private async retryMissingSummaries(
+    apiKey: string,
+    missing: PreparedBookmark[],
+    assignments: Map<string, CategoryResult>
+  ): Promise<Map<string, string>> {
+    const recovered = new Map<string, string>();
+    let remaining = [...missing];
+
+    for (let attempt = 1; attempt <= MISSING_OUTPUT_RETRY_ATTEMPTS && remaining.length > 0; attempt += 1) {
+      const batches = chunk(remaining, MISSING_OUTPUT_RETRY_BATCH_SIZE);
+      const nextRemaining: PreparedBookmark[] = [];
+
+      for (const batch of batches) {
+        try {
+          const response = await this.callOpenAiJson<{ items: SummaryResult[] }>({
+            apiKey,
+            model: SUMMARY_MODEL,
+            systemPrompt:
+              "You are retrying missing summaries. Return strict JSON as {\"items\":[...]} with exactly one item for every bookmark id and no omissions.",
+            userPrompt: JSON.stringify({
+              bookmarks: batch.map((bookmark) => ({
+                id: bookmark.id,
+                title: bookmark.title,
+                url: bookmark.url,
+                targetUrl: bookmark.targetUrl,
+                folderPath: bookmark.folderPath,
+                category: assignments.get(bookmark.id)?.category,
+                tags: assignments.get(bookmark.id)?.tags ?? [],
+                excerpt: bookmark.excerpt.slice(0, 2200)
+              }))
+            }),
+            temperature: 0
+          });
+
+          this.recordUsage(SUMMARY_MODEL, response.usage);
+          const items = parseSummaryItems(response.data);
+          const byId = new Map(items.map((item) => [item.id, item.summary]));
+
+          for (const bookmark of batch) {
+            const summary = byId.get(bookmark.id);
+            if (summary) {
+              recovered.set(bookmark.id, summary);
+            } else {
+              nextRemaining.push(bookmark);
+            }
+          }
+        } catch (error) {
+          if (TRIAGE_DEBUG) {
+            const message = error instanceof Error ? error.message : "Unknown retry error";
+            console.warn(
+              `[triage ${this.activeStatus?.runId ?? "unknown"}] summary retry attempt ${attempt} failed: ${message}`
+            );
+          }
+          nextRemaining.push(...batch);
+        }
+      }
+
+      remaining = nextRemaining;
+    }
+
+    return recovered;
+  }
+
   private recordUsage(model: string, usage: OpenAiUsage): void {
     if (!this.activeStatus) return;
     this.activeStatus.apiCalls += 1;
@@ -831,6 +1349,8 @@ export class TriageService {
       apiCalls: this.activeStatus.apiCalls,
       promptTokens: this.activeStatus.promptTokens,
       completionTokens: this.activeStatus.completionTokens,
+      missingOutputRetriesAttempted: this.activeStatus.missingOutputRetriesAttempted,
+      missingOutputRetriesRecovered: this.activeStatus.missingOutputRetriesRecovered,
       estimatedCostUsd: this.activeStatus.estimatedCostUsd
     });
   }
@@ -838,6 +1358,11 @@ export class TriageService {
   private setStage(stage: Stage): void {
     if (!this.activeStatus) return;
     this.activeStatus.stage = stage;
+    if (TRIAGE_DEBUG) {
+      console.info(
+        `[triage ${this.activeStatus.runId}] stage=${stage} prepared=${this.activeStatus.preparedCount}/${this.activeStatus.totalBookmarks} processed=${this.activeStatus.processedCount}/${this.activeStatus.totalBookmarks}`
+      );
+    }
   }
 
   private bumpCounts(input: {
@@ -853,5 +1378,16 @@ export class TriageService {
     this.activeStatus.categorizedCount += input.categorized ?? 0;
     this.activeStatus.uncategorizedCount += input.uncategorized ?? 0;
     this.activeStatus.failedCount += input.failed ?? 0;
+  }
+
+  private bumpPrepared(): void {
+    if (!this.activeStatus) return;
+    this.activeStatus.preparedCount += 1;
+  }
+
+  private bumpMissingOutputRetries(input: { attempted?: number; recovered?: number }): void {
+    if (!this.activeStatus) return;
+    this.activeStatus.missingOutputRetriesAttempted += input.attempted ?? 0;
+    this.activeStatus.missingOutputRetriesRecovered += input.recovered ?? 0;
   }
 }

@@ -6,8 +6,18 @@ const triageService = new TriageService();
 
 export async function registerTriageRoutes(app: FastifyInstance) {
   app.post("/triage/runs", async (request, reply) => {
-    const body = (request.body ?? {}) as { ignoreCache?: boolean };
-    const started = await triageService.startRun({ ignoreCache: body.ignoreCache === true });
+    const body = (request.body ?? {}) as {
+      ignoreCache?: boolean;
+      limit?: number;
+      bookmarkIds?: string[];
+    };
+    const started = await triageService.startRun({
+      ignoreCache: body.ignoreCache === true,
+      limit: typeof body.limit === "number" ? body.limit : undefined,
+      bookmarkIds: Array.isArray(body.bookmarkIds)
+        ? body.bookmarkIds.filter((item): item is string => typeof item === "string")
+        : undefined
+    });
 
     return reply.code(started.alreadyRunning ? 409 : 202).send({
       runId: started.runId,

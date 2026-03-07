@@ -21,4 +21,15 @@ db.pragma("foreign_keys = ON");
 const schemaSql = readFileSync(SCHEMA_PATH, "utf-8");
 db.exec(schemaSql);
 
+function ensureTriageRunColumn(name: string, sqlType: string, defaultValue: string): void {
+  const columns = db.prepare("PRAGMA table_info(triage_runs)").all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === name)) return;
+  db.exec(
+    `ALTER TABLE triage_runs ADD COLUMN ${name} ${sqlType} NOT NULL DEFAULT ${defaultValue}`
+  );
+}
+
+ensureTriageRunColumn("missing_output_retries_attempted", "INTEGER", "0");
+ensureTriageRunColumn("missing_output_retries_recovered", "INTEGER", "0");
+
 export { db };

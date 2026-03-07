@@ -1,483 +1,596 @@
 import { useEffect, useMemo, useState } from "react";
 
-type ImportSummary = {
-  importId: string;
-  source: "chrome" | "safari" | "unknown";
-  fileName: string;
-  startedAt: string;
-  finishedAt: string | null;
-  total: number;
-  imported: number;
-  duplicates: number;
-  live: number;
-  redirected: number;
-  dead: number;
-  timedOut: number;
-  durationMs: number;
-};
-
 type BookmarkStatus = "live" | "redirected" | "dead" | "untested";
-type StatusFilter = "all" | "live" | "dead";
+type ReviewAction = "keep" | "archive" | "delete" | "unreviewed";
 
-type BookmarkRecord = {
+type OrganizationBookmark = {
   id: string;
-  url: string;
   title: string;
+  url: string;
   folderPath: string | null;
   status: BookmarkStatus;
-  httpStatusCode: number | null;
-  checkedAt: string | null;
+  category: string | null;
+  tags: string[];
+  summary: string | null;
+  reviewAction: ReviewAction;
 };
 
-type TriageStatus = {
-  runId: string;
-  status: "running" | "completed" | "failed";
-  stage:
-    | "idle"
-    | "preparing"
-    | "discovering_categories"
-    | "categorizing"
-    | "summarizing"
-    | "finalizing"
-    | "completed"
-    | "failed";
-  startedAt: string;
-  finishedAt: string | null;
-  totalBookmarks: number;
-  processedCount: number;
-  cachedCount: number;
-  categorizedCount: number;
-  uncategorizedCount: number;
-  failedCount: number;
-  apiCalls: number;
-  promptTokens: number;
-  completionTokens: number;
-  estimatedCostUsd: number;
-  lastError: string | null;
+type OrganizationOverview = {
+  stats: {
+    totalBookmarks: number;
+    uncategorizedCount: number;
+    reviewedCount: number;
+    reviewPct: number;
+    byCategory: Array<{ category: string; count: number }>;
+    byStatus: Array<{ status: BookmarkStatus; count: number }>;
+    byReviewAction: Array<{ action: ReviewAction; count: number }>;
+  };
 };
 
-type TriageCategory = {
-  category: string;
-  count: number;
-};
-
-type TriageUncategorized = {
+type SearchResult = {
   bookmarkId: string;
   title: string;
   url: string;
-  reasonCode: string;
+  status: BookmarkStatus;
+  category: string | null;
+  tags: string[];
+  summary: string | null;
+  reviewAction: ReviewAction;
+  score: number;
+  matchReasons: string[];
 };
 
-type TriageSummary = {
-  run: {
-    id: string;
-    status: "running" | "completed" | "failed";
-    startedAt: string;
-    finishedAt: string | null;
-    durationMs: number;
-    totalBookmarks: number;
-    processedCount: number;
-    cachedCount: number;
-    categorizedCount: number;
-    uncategorizedCount: number;
-    failedCount: number;
-    categoryModel: string;
-    summaryModel: string;
-    promptVersion: string;
-    apiCalls: number;
-    promptTokens: number;
-    completionTokens: number;
-    estimatedCostUsd: number;
-    errorMessage: string | null;
-  };
-  categories: TriageCategory[];
-  uncategorized: TriageUncategorized[];
+type SearchResponse = {
+  model: string;
+  totalCandidates: number;
+  results: SearchResult[];
 };
+
+type SortBy = "date_added" | "title" | "category";
+
+const API_BASE = "http://127.0.0.1:4040";
 
 function formatStatusLabel(status: BookmarkStatus) {
-  if (status === "redirected") return "redirect";
-  return status;
+  return status === "redirected" ? "redirect" : status;
 }
 
-function formatTriageStage(stage: TriageStatus["stage"]): string {
-  return stage.replaceAll("_", " ");
-}
-
-function deadReason(bookmark: BookmarkRecord): string {
-  if (bookmark.status !== "dead") return "";
-  if (bookmark.httpStatusCode !== null) return `HTTP ${bookmark.httpStatusCode}`;
-  return "No HTTP response (timeout or connection refused)";
-}
-
-function formatUsd(value: number): string {
-  return `$${value.toFixed(4)}`;
+function formatPercent(value: number): string {
+  return `${value.toFixed(1)}%`;
 }
 
 export function App() {
-  const [file, setFile] = useState<File | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [loadingBookmarks, setLoadingBookmarks] = useState(false);
-  const [runningTriage, setRunningTriage] = useState(false);
-  const [ignoreCache, setIgnoreCache] = useState(false);
+  const [overview, setOverview] = useState<OrganizationOverview | null>(null);
+  const [bookmarks, setBookmarks] = useState<OrganizationBookmark[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [results, setResults] = useState<ImportSummary[]>([]);
-  const [bookmarks, setBookmarks] = useState<BookmarkRecord[]>([]);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [triageStatus, setTriageStatus] = useState<TriageStatus | null>(null);
-  const [triageSummary, setTriageSummary] = useState<TriageSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [working, setWorking] = useState(false);
 
-  const latestImport = useMemo(() => results[0] ?? null, [results]);
+  const [statusFilter, setStatusFilter] = useState<"all" | BookmarkStatus>("all");
+  const [reviewFilter, setReviewFilter] = useState<"all" | ReviewAction>("all");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
+  const [sortBy, setSortBy] = useState<SortBy>("date_added");
+  const [uncategorizedOnly, setUncategorizedOnly] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
-  async function loadImportResults() {
-    const response = await fetch("http://127.0.0.1:4040/imports?limit=30");
-    if (!response.ok) {
-      throw new Error("Failed to load import summaries.");
-    }
-    const payload = (await response.json()) as { results: ImportSummary[] };
-    setResults(payload.results);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResponse | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [syncingEmbeddings, setSyncingEmbeddings] = useState(false);
+
+  const [bulkAction, setBulkAction] = useState<"keep" | "archive" | "delete" | "unreviewed">("keep");
+  const [bulkCategory, setBulkCategory] = useState("");
+  const [bulkTag, setBulkTag] = useState("");
+
+  const [renameFrom, setRenameFrom] = useState("");
+  const [renameTo, setRenameTo] = useState("");
+  const [mergeFrom, setMergeFrom] = useState("");
+  const [mergeTo, setMergeTo] = useState("");
+  const [deleteCategory, setDeleteCategory] = useState("");
+
+  const selectedLabel = useMemo(() => `${selectedIds.length} selected`, [selectedIds]);
+
+  async function fetchOverview() {
+    const response = await fetch(`${API_BASE}/organization/overview`);
+    if (!response.ok) throw new Error("Failed to load organisation overview.");
+    setOverview((await response.json()) as OrganizationOverview);
   }
 
-  async function loadBookmarks(filter: StatusFilter) {
-    setLoadingBookmarks(true);
-    try {
-      const response = await fetch(`http://127.0.0.1:4040/bookmarks?status=${filter}`);
-      if (!response.ok) {
-        throw new Error("Failed to load bookmarks.");
-      }
-      const payload = (await response.json()) as { results: BookmarkRecord[] };
-      setBookmarks(payload.results);
-    } finally {
-      setLoadingBookmarks(false);
-    }
+  async function fetchBookmarks() {
+    const params = new URLSearchParams();
+    params.set("status", statusFilter);
+    params.set("reviewAction", reviewFilter);
+    params.set("sortBy", sortBy);
+    params.set("sortDirection", "desc");
+    if (categoryFilter.trim()) params.set("category", categoryFilter.trim());
+    if (tagFilter.trim()) params.set("tag", tagFilter.trim());
+    if (uncategorizedOnly) params.set("uncategorizedOnly", "true");
+
+    const response = await fetch(`${API_BASE}/organization/bookmarks?${params.toString()}`);
+    if (!response.ok) throw new Error("Failed to load bookmarks.");
+    const payload = (await response.json()) as { results: OrganizationBookmark[] };
+    setBookmarks(payload.results);
   }
 
-  async function loadTriageStatus() {
-    const response = await fetch("http://127.0.0.1:4040/triage/status");
-    if (!response.ok) {
-      throw new Error("Failed to load triage status.");
-    }
-    const payload = (await response.json()) as { status: TriageStatus | null };
-    setTriageStatus(payload.status);
-    setRunningTriage(payload.status?.status === "running");
-  }
-
-  async function loadTriageSummary() {
-    const response = await fetch("http://127.0.0.1:4040/triage/runs/latest");
-    if (!response.ok) {
-      throw new Error("Failed to load triage summary.");
-    }
-    const payload = (await response.json()) as { summary: TriageSummary | null };
-    setTriageSummary(payload.summary);
-  }
-
-  useEffect(() => {
-    async function loadInitial() {
-      try {
-        setError(null);
-        await Promise.all([
-          loadImportResults(),
-          loadBookmarks(statusFilter),
-          loadTriageStatus(),
-          loadTriageSummary()
-        ]);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load data.");
-      }
-    }
-    void loadInitial();
-  }, []);
-
-  useEffect(() => {
-    async function refreshBookmarksForFilter() {
-      try {
-        setError(null);
-        await loadBookmarks(statusFilter);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load bookmarks.");
-      }
-    }
-    void refreshBookmarksForFilter();
-  }, [statusFilter]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void (async () => {
-        try {
-          await loadTriageStatus();
-          if (runningTriage) {
-            await loadTriageSummary();
-          }
-        } catch {
-          // Keep polling; surface API failures in explicit actions.
-        }
-      })();
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [runningTriage]);
-
-  async function handleImport() {
-    if (!file) {
-      setError("Choose a bookmarks HTML file first.");
-      return;
-    }
-
-    setError(null);
+  async function refreshAll() {
     setLoading(true);
-
     try {
-      const formData = new FormData();
-      formData.append("file", file, file.name);
-
-      const response = await fetch("http://127.0.0.1:4040/imports", {
-        method: "POST",
-        body: formData
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string };
-        throw new Error(payload.error ?? "Import failed.");
-      }
-
-      const summary = (await response.json()) as ImportSummary;
-      setResults((prev) => [summary, ...prev]);
-      setFile(null);
-      await loadBookmarks(statusFilter);
-      await loadImportResults();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed.");
+      await Promise.all([fetchOverview(), fetchBookmarks()]);
+      setError(null);
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Failed to refresh.");
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleStartTriage() {
-    setError(null);
-    setRunningTriage(true);
+  useEffect(() => {
+    void refreshAll();
+  }, []);
 
+  useEffect(() => {
+    void fetchBookmarks().catch((apiError) => {
+      setError(apiError instanceof Error ? apiError.message : "Failed to load bookmarks.");
+    });
+  }, [statusFilter, reviewFilter, categoryFilter, tagFilter, sortBy, uncategorizedOnly]);
+
+  useEffect(() => {
+    const ids = new Set(bookmarks.map((bookmark) => bookmark.id));
+    setSelectedIds((previous) => previous.filter((id) => ids.has(id)));
+  }, [bookmarks]);
+
+  function toggleSelected(bookmarkId: string) {
+    setSelectedIds((previous) =>
+      previous.includes(bookmarkId)
+        ? previous.filter((id) => id !== bookmarkId)
+        : [...previous, bookmarkId]
+    );
+  }
+
+  async function patchBookmark(
+    bookmarkId: string,
+    updates: { category?: string | null; tags?: string[]; summary?: string | null; reviewAction?: ReviewAction }
+  ) {
+    setWorking(true);
     try {
-      const response = await fetch("http://127.0.0.1:4040/triage/runs", {
-        method: "POST",
+      const response = await fetch(`${API_BASE}/organization/bookmarks/${bookmarkId}`, {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ignoreCache })
+        body: JSON.stringify(updates)
       });
-
-      if (!response.ok && response.status !== 409) {
-        const payload = (await response.json()) as { error?: string };
-        throw new Error(payload.error ?? "Failed to start triage run.");
-      }
-
-      await loadTriageStatus();
-      await loadTriageSummary();
-    } catch (err) {
-      setRunningTriage(false);
-      setError(err instanceof Error ? err.message : "Failed to start triage run.");
+      if (!response.ok) throw new Error("Failed to update bookmark.");
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Failed to update bookmark.");
+    } finally {
+      setWorking(false);
     }
   }
 
-  const progressPct =
-    triageStatus && triageStatus.totalBookmarks > 0
-      ? Math.min(100, Math.round((triageStatus.processedCount / triageStatus.totalBookmarks) * 100))
-      : 0;
+  async function bulkUpdate(payload: Record<string, unknown>) {
+    if (selectedIds.length === 0) {
+      setError("Select at least one bookmark.");
+      return;
+    }
+
+    setWorking(true);
+    try {
+      const response = await fetch(`${API_BASE}/organization/bookmarks/bulk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bookmarkIds: selectedIds, ...payload })
+      });
+      if (!response.ok) throw new Error("Bulk update failed.");
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Bulk update failed.");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function reTriageSelected() {
+    if (selectedIds.length === 0) {
+      setError("Select bookmarks to re-triage.");
+      return;
+    }
+
+    setWorking(true);
+    try {
+      const response = await fetch(`${API_BASE}/triage/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bookmarkIds: selectedIds, ignoreCache: true })
+      });
+      if (!response.ok && response.status !== 409) throw new Error("Failed to start re-triage run.");
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Failed to re-triage.");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function mutateCategory(path: string, method: "POST" | "DELETE", body?: object) {
+    setWorking(true);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method,
+        headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined
+      });
+      if (!response.ok) throw new Error("Category action failed.");
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Category action failed.");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function runSearch() {
+    if (!searchQuery.trim()) {
+      setError("Enter a search query first.");
+      return;
+    }
+
+    setSearching(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/search/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: searchQuery,
+          scope: {
+            category: categoryFilter.trim() || undefined,
+            tag: tagFilter.trim() || undefined,
+            status: statusFilter,
+            reviewAction: reviewFilter
+          },
+          limit: 20
+        })
+      });
+
+      if (!response.ok) throw new Error("Search failed.");
+      setSearchResults((await response.json()) as SearchResponse);
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function handleGenerateEmbeddings() {
+    setSyncingEmbeddings(true);
+    setError(null);
+    try {
+      const response = await fetch(`${API_BASE}/search/embeddings/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      if (!response.ok) throw new Error("Embedding generation failed.");
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Embedding generation failed.");
+    } finally {
+      setSyncingEmbeddings(false);
+    }
+  }
 
   return (
     <main className="app-shell">
-      <h1>Bookmark Manager</h1>
-      <p>Import Safari/Chrome bookmark exports and review results.</p>
+      <h1 className="app-title">Bookmark Manager</h1>
+      <p className="app-subtitle">
+        Import, triage, organize, and search bookmarks with a calm, focused workspace.
+      </p>
 
-      <section className="panel">
-        <input
-          type="file"
-          accept=".html,text/html"
-          onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
-        />
-        <button type="button" onClick={handleImport} disabled={loading || !file}>
-          {loading ? "Importing..." : "Run Import"}
-        </button>
-        {error ? <p className="error">{error}</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+
+      <section className="results">
+        <h2 className="section-title">Organisation Dashboard</h2>
+        {loading && !overview ? <p className="muted">Loading dashboard…</p> : null}
+        {overview ? (
+          <>
+            <article className="result-card result-card--highlight">
+              <p>
+                <strong>Total:</strong> {overview.stats.totalBookmarks} | <strong>Reviewed:</strong>{" "}
+                {overview.stats.reviewedCount} ({formatPercent(overview.stats.reviewPct)})
+              </p>
+              <p>
+                <strong>Uncategorized queue:</strong> {overview.stats.uncategorizedCount}
+              </p>
+              <button type="button" className="button-secondary" onClick={() => setUncategorizedOnly(true)}>
+                Focus uncategorized (316 currently expected)
+              </button>
+            </article>
+
+            <article className="result-card">
+              <h3>Browse categories</h3>
+              {overview.stats.byCategory.map((item) => (
+                <p key={item.category} className="stat-row">
+                  <strong>{item.category}</strong>
+                  <span>{item.count}</span>
+                </p>
+              ))}
+            </article>
+          </>
+        ) : null}
       </section>
 
       <section className="results">
-        <h2>Triage</h2>
+        <h2 className="section-title">Organisation Workspace</h2>
         <article className="result-card">
-          <div className="triage-controls">
-            <button
-              type="button"
-              onClick={handleStartTriage}
-              disabled={runningTriage || bookmarks.length === 0}
-            >
-              {runningTriage ? "Triage Running..." : "Run Triage"}
-            </button>
+          <div className="filters">
+            <select value={statusFilter} onChange={(event) => setStatusFilter(event.currentTarget.value as "all" | BookmarkStatus)}>
+              <option value="all">Any status</option>
+              <option value="live">Live</option>
+              <option value="redirected">Redirected</option>
+              <option value="dead">Dead</option>
+              <option value="untested">Untested</option>
+            </select>
+            <select value={reviewFilter} onChange={(event) => setReviewFilter(event.currentTarget.value as "all" | ReviewAction)}>
+              <option value="all">Any triage action</option>
+              <option value="unreviewed">Unreviewed</option>
+              <option value="keep">Keep</option>
+              <option value="archive">Archive</option>
+              <option value="delete">Delete</option>
+            </select>
+            <input placeholder="Category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.currentTarget.value)} />
+            <input placeholder="Tag" value={tagFilter} onChange={(event) => setTagFilter(event.currentTarget.value)} />
+            <select value={sortBy} onChange={(event) => setSortBy(event.currentTarget.value as SortBy)}>
+              <option value="date_added">Sort by date</option>
+              <option value="title">Sort by title</option>
+              <option value="category">Sort by category</option>
+            </select>
             <label className="checkbox-row">
               <input
                 type="checkbox"
-                checked={ignoreCache}
-                onChange={(event) => setIgnoreCache(event.currentTarget.checked)}
-                disabled={runningTriage}
+                checked={uncategorizedOnly}
+                onChange={(event) => setUncategorizedOnly(event.currentTarget.checked)}
               />
-              Ignore cache and reprocess all bookmarks
+              Uncategorized only
             </label>
           </div>
-          {triageStatus ? (
-            <>
-              <p>
-                <strong>Stage:</strong> {formatTriageStage(triageStatus.stage)}
-              </p>
-              <p>
-                <strong>Progress:</strong> {triageStatus.processedCount} / {triageStatus.totalBookmarks} ({progressPct}%)
-              </p>
-              <p>
-                <strong>Cache hits:</strong> {triageStatus.cachedCount} | <strong>Categorized:</strong>{" "}
-                {triageStatus.categorizedCount} | <strong>Uncategorized:</strong>{" "}
-                {triageStatus.uncategorizedCount}
-              </p>
-              <p>
-                <strong>API calls:</strong> {triageStatus.apiCalls} | <strong>Prompt tokens:</strong>{" "}
-                {triageStatus.promptTokens} | <strong>Completion tokens:</strong>{" "}
-                {triageStatus.completionTokens}
-              </p>
-              <p>
-                <strong>Estimated cost:</strong> {formatUsd(triageStatus.estimatedCostUsd)}
-              </p>
-              {triageStatus.lastError ? (
-                <p className="error">
-                  <strong>Last error:</strong> {triageStatus.lastError}
-                </p>
-              ) : null}
-            </>
-          ) : (
-            <p>No triage run yet.</p>
-          )}
         </article>
 
-        {triageSummary ? (
-          <article className="result-card">
-            <p>
-              <strong>Latest run:</strong> {triageSummary.run.id}
-            </p>
-            <p>
-              <strong>Status:</strong> {triageSummary.run.status} | <strong>Duration:</strong>{" "}
-              {triageSummary.run.durationMs}ms
-            </p>
-            <p>
-              <strong>Models:</strong> {triageSummary.run.categoryModel} (categorization),{" "}
-              {triageSummary.run.summaryModel} (summary)
-            </p>
-            <h3>Categories</h3>
-            {triageSummary.categories.length === 0 ? <p>No categories generated yet.</p> : null}
-            {triageSummary.categories.map((item) => (
-              <p key={item.category}>
-                <strong>{item.category}:</strong> {item.count}
-              </p>
-            ))}
+        <article className="result-card">
+          <p>{selectedLabel}</p>
+          <div className="filters">
+            <select value={bulkAction} onChange={(event) => setBulkAction(event.currentTarget.value as "keep" | "archive" | "delete" | "unreviewed")}>
+              <option value="keep">Keep</option>
+              <option value="archive">Archive</option>
+              <option value="delete">Delete</option>
+              <option value="unreviewed">Unreviewed</option>
+            </select>
+            <button type="button" disabled={working} onClick={() => void bulkUpdate({ reviewAction: bulkAction })}>
+              Bulk set action
+            </button>
+            <input
+              placeholder="Bulk category (empty = uncategorized)"
+              value={bulkCategory}
+              onChange={(event) => setBulkCategory(event.currentTarget.value)}
+            />
+            <button type="button" disabled={working} onClick={() => void bulkUpdate({ category: bulkCategory.trim() || null })}>
+              Bulk move category
+            </button>
+            <input placeholder="Bulk tag" value={bulkTag} onChange={(event) => setBulkTag(event.currentTarget.value)} />
+            <button type="button" disabled={working} onClick={() => void bulkUpdate({ addTag: bulkTag.trim() })}>
+              Bulk add tag
+            </button>
+            <button type="button" disabled={working} onClick={reTriageSelected}>
+              Re-triage selected
+            </button>
+          </div>
+        </article>
 
-            <h3>Couldn&apos;t Categorize</h3>
-            {triageSummary.uncategorized.length === 0 ? <p>None.</p> : null}
-            {triageSummary.uncategorized.slice(0, 20).map((item) => (
-              <p key={item.bookmarkId}>
-                <strong>{item.title}</strong> ({item.reasonCode})
-              </p>
-            ))}
+        <article className="result-card">
+          <h3>Category overrides</h3>
+          <div className="filters">
+            <input placeholder="Rename from" value={renameFrom} onChange={(event) => setRenameFrom(event.currentTarget.value)} />
+            <input placeholder="Rename to" value={renameTo} onChange={(event) => setRenameTo(event.currentTarget.value)} />
+            <button type="button" disabled={working} onClick={() => void mutateCategory("/organization/categories/rename", "POST", { from: renameFrom, to: renameTo })}>
+              Rename category
+            </button>
+          </div>
+          <div className="filters">
+            <input
+              placeholder="Merge from (comma-separated)"
+              value={mergeFrom}
+              onChange={(event) => setMergeFrom(event.currentTarget.value)}
+            />
+            <input placeholder="Merge into" value={mergeTo} onChange={(event) => setMergeTo(event.currentTarget.value)} />
+            <button
+              type="button"
+              disabled={working}
+              onClick={() =>
+                void mutateCategory("/organization/categories/merge", "POST", {
+                  sourceCategories: mergeFrom
+                    .split(",")
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                  targetCategory: mergeTo
+                })
+              }
+            >
+              Merge categories
+            </button>
+          </div>
+          <div className="filters">
+            <input
+              placeholder="Delete category"
+              value={deleteCategory}
+              onChange={(event) => setDeleteCategory(event.currentTarget.value)}
+            />
+            <button
+              type="button"
+              disabled={working}
+              onClick={() =>
+                void mutateCategory(`/organization/categories/${encodeURIComponent(deleteCategory)}`, "DELETE")
+              }
+            >
+              Delete category
+            </button>
+          </div>
+        </article>
+
+        {bookmarks.length === 0 ? (
+          <article className="result-card empty-state">
+            <p>No bookmarks match the current filters.</p>
+            <p className="muted">Try clearing category/tag filters or disabling uncategorized-only mode.</p>
           </article>
         ) : null}
-      </section>
 
-      <section className="results">
-        <h2>Import Summary</h2>
-        {latestImport ? (
-          <article className="result-card result-card--highlight">
-            <p>
-              <strong>Last Import:</strong> {latestImport.fileName}
-            </p>
-            <p>
-              <strong>Total Imported File Entries:</strong> {latestImport.total}
-            </p>
-            <p>
-              <strong>Inserted:</strong> {latestImport.imported} |{" "}
-              <strong>Duplicates Skipped:</strong> {latestImport.duplicates}
-            </p>
-            <p>
-              <strong>Live:</strong> {latestImport.live} | <strong>Redirect:</strong>{" "}
-              {latestImport.redirected} | <strong>Dead:</strong> {latestImport.dead}
-            </p>
-          </article>
-        ) : null}
-
-        <h3>Recent Imports</h3>
-        {results.length === 0 ? <p>No imports yet.</p> : null}
-        {results.map((result) => (
-          <article key={result.importId} className="result-card">
-            <p>
-              <strong>Source:</strong> {result.source} | <strong>File:</strong> {result.fileName}
-            </p>
-            <p>
-              <strong>Total:</strong> {result.total} | <strong>Imported:</strong> {result.imported} |{" "}
-              <strong>Duplicates:</strong> {result.duplicates}
-            </p>
-            <p>
-              <strong>Live:</strong> {result.live} | <strong>Redirected:</strong> {result.redirected} |{" "}
-              <strong>Dead:</strong> {result.dead}
-            </p>
-            <p>
-              <strong>Timed Out:</strong> {result.timedOut} | <strong>Duration:</strong>{" "}
-              {result.durationMs}ms
-            </p>
-          </article>
-        ))}
-      </section>
-
-      <section className="results">
-        <h2>Bookmarks</h2>
-        <div className="filters" role="group" aria-label="Filter bookmarks by status">
-          <button
-            type="button"
-            className={statusFilter === "all" ? "filter-button active" : "filter-button"}
-            onClick={() => setStatusFilter("all")}
-          >
-            All
-          </button>
-          <button
-            type="button"
-            className={statusFilter === "live" ? "filter-button active" : "filter-button"}
-            onClick={() => setStatusFilter("live")}
-          >
-            Live
-          </button>
-          <button
-            type="button"
-            className={statusFilter === "dead" ? "filter-button active" : "filter-button"}
-            onClick={() => setStatusFilter("dead")}
-          >
-            Dead
-          </button>
-        </div>
-
-        {loadingBookmarks ? <p>Loading bookmarks...</p> : null}
-        {!loadingBookmarks && bookmarks.length === 0 ? <p>No bookmarks for this filter.</p> : null}
         {bookmarks.map((bookmark) => (
-          <article key={bookmark.id} className="result-card bookmark-card">
-            <header className="bookmark-head">
-              <a href={bookmark.url} target="_blank" rel="noreferrer">
-                {bookmark.title}
-              </a>
-              <span className={`status-badge status-${bookmark.status}`}>
-                {formatStatusLabel(bookmark.status)}
-              </span>
-            </header>
-            <p className="bookmark-url">{bookmark.url}</p>
-            {bookmark.folderPath ? (
-              <p>
-                <strong>Folder:</strong> {bookmark.folderPath}
-              </p>
-            ) : null}
-            {bookmark.status === "dead" ? (
-              <p className="dead-reason">
-                <strong>Reason:</strong> {deadReason(bookmark)}
-              </p>
-            ) : null}
-          </article>
+          <BookmarkCard
+            key={bookmark.id}
+            bookmark={bookmark}
+            selected={selectedIds.includes(bookmark.id)}
+            working={working}
+            onToggleSelected={toggleSelected}
+            onSave={patchBookmark}
+          />
         ))}
+      </section>
+
+      <section className="results">
+        <h2 className="section-title">Natural Language Search</h2>
+        <article className="result-card">
+          <div className="filters">
+            <input
+              placeholder="e.g. recipes I saved from YouTube"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.currentTarget.value)}
+            />
+            <button type="button" className="button-secondary" onClick={handleGenerateEmbeddings} disabled={syncingEmbeddings}>
+              {syncingEmbeddings ? "Generating..." : "Generate embeddings"}
+            </button>
+            <button type="button" onClick={runSearch} disabled={searching}>
+              {searching ? "Searching..." : "Search"}
+            </button>
+          </div>
+        </article>
+
+        {searchResults ? (
+          <>
+            <article className="result-card">
+              <p>
+                <strong>Model:</strong> {searchResults.model} | <strong>Candidates:</strong>{" "}
+                {searchResults.totalCandidates}
+              </p>
+            </article>
+            {searchResults.results.map((result) => (
+              <article key={result.bookmarkId} className="result-card bookmark-card">
+                <header className="bookmark-head">
+                  <a href={result.url} target="_blank" rel="noreferrer">
+                    {result.title}
+                  </a>
+                  <span className={`status-badge status-${result.status}`}>{formatStatusLabel(result.status)}</span>
+                </header>
+                <p className="bookmark-url">{result.url}</p>
+                <p>
+                  <strong>Relevance:</strong> {(result.score * 100).toFixed(1)}%
+                </p>
+                <p>
+                  <strong>Category:</strong> {result.category ?? "Uncategorized"} | <strong>Action:</strong>{" "}
+                  {result.reviewAction}
+                </p>
+                <p>
+                  <strong>Summary:</strong> {result.summary ?? "No summary"}
+                </p>
+                <p>
+                  <strong>Why matched:</strong>{" "}
+                  {result.matchReasons.length > 0 ? result.matchReasons.join("; ") : "semantic similarity"}
+                </p>
+              </article>
+            ))}
+            {searchResults.results.length === 0 ? (
+              <article className="result-card empty-state">
+                <p>No results found for this query.</p>
+                <p className="muted">Try a broader query or remove category/tag constraints.</p>
+              </article>
+            ) : null}
+          </>
+        ) : (
+          <article className="result-card empty-state">
+            <p>Search results will appear here.</p>
+            <p className="muted">Try a natural language query like “articles about investing”.</p>
+          </article>
+        )}
       </section>
     </main>
+  );
+}
+
+function BookmarkCard(props: {
+  bookmark: OrganizationBookmark;
+  selected: boolean;
+  working: boolean;
+  onToggleSelected: (bookmarkId: string) => void;
+  onSave: (
+    bookmarkId: string,
+    updates: { category?: string | null; tags?: string[]; summary?: string | null; reviewAction?: ReviewAction }
+  ) => Promise<void>;
+}) {
+  const { bookmark, selected, working, onToggleSelected, onSave } = props;
+  const [category, setCategory] = useState(bookmark.category ?? "");
+  const [tags, setTags] = useState(bookmark.tags.join(", "));
+  const [summary, setSummary] = useState(bookmark.summary ?? "");
+  const [reviewAction, setReviewAction] = useState<ReviewAction>(bookmark.reviewAction);
+
+  useEffect(() => {
+    setCategory(bookmark.category ?? "");
+    setTags(bookmark.tags.join(", "));
+    setSummary(bookmark.summary ?? "");
+    setReviewAction(bookmark.reviewAction);
+  }, [bookmark]);
+
+  return (
+    <article className="result-card bookmark-card">
+      <header className="bookmark-head">
+        <label className="checkbox-row">
+          <input type="checkbox" checked={selected} onChange={() => onToggleSelected(bookmark.id)} />
+          <a href={bookmark.url} target="_blank" rel="noreferrer">
+            {bookmark.title}
+          </a>
+        </label>
+        <span className={`status-badge status-${bookmark.status}`}>{formatStatusLabel(bookmark.status)}</span>
+      </header>
+
+      <p className="bookmark-url">{bookmark.url}</p>
+      <p className="bookmark-meta">
+        <strong>Category:</strong> {bookmark.category ?? "Uncategorized"} | <strong>Action:</strong>{" "}
+        {bookmark.reviewAction}
+      </p>
+
+      <div className="triage-controls">
+        <input value={category} onChange={(event) => setCategory(event.currentTarget.value)} placeholder="Category" />
+        <input value={tags} onChange={(event) => setTags(event.currentTarget.value)} placeholder="Tags (comma-separated)" />
+        <textarea value={summary} onChange={(event) => setSummary(event.currentTarget.value)} rows={3} />
+        <select value={reviewAction} onChange={(event) => setReviewAction(event.currentTarget.value as ReviewAction)}>
+          <option value="unreviewed">Unreviewed</option>
+          <option value="keep">Keep</option>
+          <option value="archive">Archive</option>
+          <option value="delete">Delete</option>
+        </select>
+        <button
+          type="button"
+          disabled={working}
+          onClick={() =>
+            void onSave(bookmark.id, {
+              category: category.trim() || null,
+              tags: tags
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+              summary: summary.trim() || null,
+              reviewAction
+            })
+          }
+        >
+          Save overrides
+        </button>
+      </div>
+    </article>
   );
 }

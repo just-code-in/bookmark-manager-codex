@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS triage_runs (
   api_calls INTEGER NOT NULL DEFAULT 0,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
+  missing_output_retries_attempted INTEGER NOT NULL DEFAULT 0,
+  missing_output_retries_recovered INTEGER NOT NULL DEFAULT 0,
   estimated_cost_usd REAL NOT NULL DEFAULT 0,
   error_message TEXT
 );
@@ -69,3 +71,25 @@ CREATE TABLE IF NOT EXISTS bookmark_triage (
   FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id),
   FOREIGN KEY (triage_run_id) REFERENCES triage_runs(id)
 );
+
+CREATE TABLE IF NOT EXISTS bookmark_organization (
+  bookmark_id TEXT PRIMARY KEY,
+  category TEXT,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  summary TEXT,
+  review_action TEXT NOT NULL DEFAULT 'unreviewed' CHECK(review_action IN ('keep', 'archive', 'delete', 'unreviewed')),
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id)
+);
+
+CREATE TABLE IF NOT EXISTS bookmark_embeddings (
+  bookmark_id TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  vector_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bookmark_organization_category ON bookmark_organization(category);
+CREATE INDEX IF NOT EXISTS idx_bookmark_organization_review_action ON bookmark_organization(review_action);

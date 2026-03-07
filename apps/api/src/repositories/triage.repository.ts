@@ -42,6 +42,8 @@ export type TriageRunRow = {
   apiCalls: number;
   promptTokens: number;
   completionTokens: number;
+  missingOutputRetriesAttempted: number;
+  missingOutputRetriesRecovered: number;
   estimatedCostUsd: number;
   errorMessage: string | null;
 };
@@ -110,6 +112,8 @@ export class TriageRepository {
     apiCalls: number;
     promptTokens: number;
     completionTokens: number;
+    missingOutputRetriesAttempted: number;
+    missingOutputRetriesRecovered: number;
     estimatedCostUsd: number;
   }): Promise<void> {
     db.prepare(
@@ -117,7 +121,9 @@ export class TriageRepository {
       UPDATE triage_runs
       SET processed_count = ?, cached_count = ?, categorized_count = ?,
           uncategorized_count = ?, failed_count = ?,
-          api_calls = ?, prompt_tokens = ?, completion_tokens = ?, estimated_cost_usd = ?
+          api_calls = ?, prompt_tokens = ?, completion_tokens = ?,
+          missing_output_retries_attempted = ?, missing_output_retries_recovered = ?,
+          estimated_cost_usd = ?
       WHERE id = ?
     `
     ).run(
@@ -129,6 +135,8 @@ export class TriageRepository {
       input.apiCalls,
       input.promptTokens,
       input.completionTokens,
+      input.missingOutputRetriesAttempted,
+      input.missingOutputRetriesRecovered,
       input.estimatedCostUsd,
       input.id
     );
@@ -146,6 +154,8 @@ export class TriageRepository {
     apiCalls: number;
     promptTokens: number;
     completionTokens: number;
+    missingOutputRetriesAttempted: number;
+    missingOutputRetriesRecovered: number;
     estimatedCostUsd: number;
   }): Promise<void> {
     db.prepare(
@@ -154,7 +164,9 @@ export class TriageRepository {
       SET status = 'completed', finished_at = ?, duration_ms = ?,
           processed_count = ?, cached_count = ?, categorized_count = ?,
           uncategorized_count = ?, failed_count = ?,
-          api_calls = ?, prompt_tokens = ?, completion_tokens = ?, estimated_cost_usd = ?
+          api_calls = ?, prompt_tokens = ?, completion_tokens = ?,
+          missing_output_retries_attempted = ?, missing_output_retries_recovered = ?,
+          estimated_cost_usd = ?
       WHERE id = ?
     `
     ).run(
@@ -168,6 +180,8 @@ export class TriageRepository {
       input.apiCalls,
       input.promptTokens,
       input.completionTokens,
+      input.missingOutputRetriesAttempted,
+      input.missingOutputRetriesRecovered,
       input.estimatedCostUsd,
       input.id
     );
@@ -185,6 +199,8 @@ export class TriageRepository {
     apiCalls: number;
     promptTokens: number;
     completionTokens: number;
+    missingOutputRetriesAttempted: number;
+    missingOutputRetriesRecovered: number;
     estimatedCostUsd: number;
     errorMessage: string;
   }): Promise<void> {
@@ -194,7 +210,9 @@ export class TriageRepository {
       SET status = 'failed', finished_at = ?, duration_ms = ?,
           processed_count = ?, cached_count = ?, categorized_count = ?,
           uncategorized_count = ?, failed_count = ?,
-          api_calls = ?, prompt_tokens = ?, completion_tokens = ?, estimated_cost_usd = ?,
+          api_calls = ?, prompt_tokens = ?, completion_tokens = ?,
+          missing_output_retries_attempted = ?, missing_output_retries_recovered = ?,
+          estimated_cost_usd = ?,
           error_message = ?
       WHERE id = ?
     `
@@ -209,6 +227,8 @@ export class TriageRepository {
       input.apiCalls,
       input.promptTokens,
       input.completionTokens,
+      input.missingOutputRetriesAttempted,
+      input.missingOutputRetriesRecovered,
       input.estimatedCostUsd,
       input.errorMessage,
       input.id
@@ -262,16 +282,28 @@ export class TriageRepository {
     transaction();
   }
 
-  async listBookmarksForTriage(): Promise<BookmarkForTriage[]> {
+  async listBookmarksForTriage(bookmarkIds?: string[]): Promise<BookmarkForTriage[]> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+
+    if (bookmarkIds && bookmarkIds.length > 0) {
+      const uniqueIds = [...new Set(bookmarkIds)];
+      where.push(`id IN (${uniqueIds.map(() => "?").join(", ")})`);
+      params.push(...uniqueIds);
+    }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
     return db
       .prepare(
         `
       SELECT id, url, title, folder_path, url_status, final_url, http_status_code
       FROM bookmarks
+      ${whereClause}
       ORDER BY created_at ASC
     `
       )
-      .all()
+      .all(...params)
       .map((row) => {
         const typed = row as {
           id: string;
@@ -364,7 +396,9 @@ export class TriageRepository {
         id, status, started_at, finished_at, duration_ms, total_bookmarks,
         processed_count, cached_count, categorized_count, uncategorized_count,
         failed_count, category_model, summary_model, prompt_version,
-        api_calls, prompt_tokens, completion_tokens, estimated_cost_usd, error_message
+        api_calls, prompt_tokens, completion_tokens,
+        missing_output_retries_attempted, missing_output_retries_recovered,
+        estimated_cost_usd, error_message
       FROM triage_runs
       WHERE id = ?
     `
@@ -388,6 +422,8 @@ export class TriageRepository {
           api_calls: number;
           prompt_tokens: number;
           completion_tokens: number;
+          missing_output_retries_attempted: number;
+          missing_output_retries_recovered: number;
           estimated_cost_usd: number;
           error_message: string | null;
         }
@@ -413,6 +449,8 @@ export class TriageRepository {
       apiCalls: row.api_calls,
       promptTokens: row.prompt_tokens,
       completionTokens: row.completion_tokens,
+      missingOutputRetriesAttempted: row.missing_output_retries_attempted,
+      missingOutputRetriesRecovered: row.missing_output_retries_recovered,
       estimatedCostUsd: row.estimated_cost_usd,
       errorMessage: row.error_message
     };

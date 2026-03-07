@@ -8,7 +8,9 @@
   ],
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
-    "dev": "npm run dev -ws --if-present",
+    "dev": "npm run dev:api & npm run dev:web",
+    "dev:api": "npm run dev -w @bookmark-manager/api",
+    "dev:web": "npm run dev -w @bookmark-manager/web -- --host 127.0.0.1 --port 4173",
     "build": "npm run build -ws --if-present",
     "check": "npm run check -ws --if-present"
   }
