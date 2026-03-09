@@ -36,8 +36,8 @@ If any of the steps below are new to you, don't worry. Step-by-step guides are i
 
 These are written for people who haven't done this before. If terms like "terminal" or "API key" aren't part of your everyday vocabulary, start here — they'll take you through the whole process at a comfortable pace.
 
-- **[Getting Started](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/getting-started.md)** — step-by-step walkthrough from installation to your first import
-- **[Your First API Key](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/your-first-api-key.md)** — how to get an OpenAI API key and connect it to the app (required for AI Triage and Search)
+- **[Getting Started](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/getting-started-codex.md)** — step-by-step walkthrough from installation to your first import
+- **[Your First API Key](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/your-first-api-key-codex.md)** — how to get an OpenAI API key and connect it to the app (required for AI Triage and Search)
 
 ### Check you have Node.js
 
