@@ -53,7 +53,7 @@ If that returns a version number (v18 or higher), you're set. If not, download i
 
 ### Setup
 
-You'll also need an **OpenAI API key** for the AI features (Triage and Search). The [Your First API Key](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/your-first-api-key.md) guide covers this in detail — you can set it up now or after your first import.
+You'll also need an **OpenAI API key** for the AI features (Triage and Search). The [Your First API Key](https://github.com/just-code-in/bookmark-manager-codex/blob/main/docs/your-first-api-key-codex.md) guide covers this in detail — you can set it up now or after your first import.
 
 ```bash
 git clone https://github.com/just-code-in/bookmark-manager-codex.git
