@@ -1,6 +1,14 @@
 # Bookmark Manager (built by OpenAI Codex)
 
-> **Note:** This build does not work. It will import and categorise your bookmarks (with mixed results), but the search feature — the whole point of the app — is broken. If you're following the Built Twice series on LinkedIn, that's part of the story: not every AI-assisted build goes smoothly. If you'd like to try a working version, head over to the [Bookmark Manager built by Claude Code](https://github.com/just-code-in/bookmark-manager-claude).
+**NOTE** ⚠️ This application does not work reliably.
+This repository exists as one half of the Built Twice experiment — the same bookmark manager spec given to two AI coding tools, built independently. This is the OpenAI Codex build.
+
+What happened: Codex completed all four build phases (Import, Triage, Organisation, Search), but the finished product has significant gaps. Triage categorised only 70% of bookmarks (vs 92% from the Claude Code build). Search was implemented without embeddings — it missed roughly 30% of the collection and couldn't find bookmarks by meaning, only by keyword matching.
+
+The debugging attempt: After the independent build was complete, Codex was given a chance to debug and fix its own search. It added semantic search — but broke the bookmark file upload in the process. When asked to restore the upload, it discovered that the frontend had never included an upload UI at all. The backend route existed (POST /imports), but no file picker or upload button was ever rendered. Three failures stacked: search didn't work, the fix broke upload, and the UI had been incomplete all along.
+
+The Claude Code build works. If you want a functioning bookmark manager, head over to the [Bookmark Manager built by Claude Code](https://github.com/just-code-in/bookmark-manager-claude).
+This repo is preserved as-is for the comparison. The code, the bugs, and the gaps are the content.
 
 **Import your browser bookmarks, let AI categorise and summarise them, then search in plain English.**
 
