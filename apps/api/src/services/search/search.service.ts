@@ -62,27 +62,84 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot(a, b) / denominator;
 }
 
-function keywordMatches(query: string, bookmark: { title: string; summary: string | null; tags: string[] }): string[] {
-  const words = query
+function extractQueryTerms(query: string): string[] {
+  return query
     .toLowerCase()
     .split(/[^a-z0-9]+/g)
     .map((item) => item.trim())
-    .filter((item) => item.length >= 3 && !STOP_WORDS.has(item));
+    .filter((item) => item.length >= 2 && !STOP_WORDS.has(item));
+}
 
-  if (words.length === 0) return [];
-
+function keywordSignals(
+  query: string,
+  bookmark: {
+    title: string;
+    url: string;
+    category: string | null;
+    summary: string | null;
+    tags: string[];
+  }
+): { score: number; reasons: string[] } {
+  const words = extractQueryTerms(query);
+  const phrase = query.trim().toLowerCase();
   const tagsLower = bookmark.tags.map((tag) => tag.toLowerCase());
   const titleLower = bookmark.title.toLowerCase();
+  const urlLower = bookmark.url.toLowerCase();
+  const categoryLower = (bookmark.category ?? "").toLowerCase();
   const summaryLower = (bookmark.summary ?? "").toLowerCase();
   const reasons = new Set<string>();
+  let score = 0;
 
-  for (const word of words) {
-    if (titleLower.includes(word)) reasons.add(`title includes “${word}”`);
-    if (summaryLower.includes(word)) reasons.add(`summary includes “${word}”`);
-    if (tagsLower.some((tag) => tag.includes(word))) reasons.add(`tag includes “${word}”`);
+  if (words.length === 0) return { score: 0, reasons: [] };
+
+  if (phrase.length >= 3) {
+    if (titleLower.includes(phrase)) {
+      score += 6;
+      reasons.add("title includes the full phrase");
+    }
+    if (summaryLower.includes(phrase)) {
+      score += 4;
+      reasons.add("summary includes the full phrase");
+    }
+    if (categoryLower.includes(phrase)) {
+      score += 3;
+      reasons.add("category includes the full phrase");
+    }
+    if (tagsLower.some((tag) => tag.includes(phrase))) {
+      score += 3;
+      reasons.add("tag includes the full phrase");
+    }
+    if (urlLower.includes(phrase)) {
+      score += 1;
+      reasons.add("URL includes the full phrase");
+    }
   }
 
-  return [...reasons];
+  for (const word of words) {
+    if (titleLower.includes(word)) {
+      score += 2;
+      reasons.add(`title includes "${word}"`);
+    }
+    if (summaryLower.includes(word)) {
+      score += 1.5;
+      reasons.add(`summary includes "${word}"`);
+    }
+    if (categoryLower.includes(word)) {
+      score += 1.5;
+      reasons.add(`category includes "${word}"`);
+    }
+    if (tagsLower.some((tag) => tag.includes(word))) {
+      score += 1.5;
+      reasons.add(`tag includes "${word}"`);
+    }
+    if (urlLower.includes(word)) {
+      score += 0.5;
+      reasons.add(`URL includes "${word}"`);
+    }
+  }
+
+  const normalizedScore = Math.min(score / Math.max(words.length * 3, 6), 1);
+  return { score: normalizedScore, reasons: [...reasons] };
 }
 
 function canonicalUrl(rawUrl: string): string {
@@ -186,27 +243,38 @@ export class SearchService {
       return { model: EMBEDDING_MODEL, totalCandidates: 0, results: [] };
     }
 
-    await this.syncEmbeddings();
+    await this.organizationRepository.syncFromTriage();
 
+    const limit = Math.max(1, Math.min(input.limit ?? 20, 100));
+    const fallbackCandidates = await this.searchRepository.listSearchCandidates(input.scope ?? {});
     const apiKey = process.env.OPENAI_API_KEY;
+
     if (!apiKey) {
-      throw new Error("OPENAI_API_KEY is required for natural language search.");
+      return this.keywordFallbackSearch(query, fallbackCandidates, limit);
     }
 
-    const [queryVector] = await this.generateEmbeddings([query], apiKey);
-    if (!queryVector) {
-      return { model: EMBEDDING_MODEL, totalCandidates: 0, results: [] };
-    }
+    try {
+      await this.syncEmbeddings();
 
-    const candidates = await this.searchRepository.listSearchCandidates(input.scope ?? {});
-    const ranked = candidates
+      const [queryVector] = await this.generateEmbeddings([query], apiKey);
+      if (!queryVector) {
+        return this.keywordFallbackSearch(query, fallbackCandidates, limit);
+      }
+
+      const candidates = (await this.searchRepository.listSearchCandidates(input.scope ?? {})).filter(
+        (candidate) => candidate.embedding.length > 0
+      );
+      const ranked = candidates
       .map((candidate) => {
-        const score = cosineSimilarity(queryVector, candidate.embedding);
-        const reasons = keywordMatches(query, {
+        const semanticScore = Math.max(cosineSimilarity(queryVector, candidate.embedding), 0);
+        const keyword = keywordSignals(query, {
           title: candidate.title,
+          url: candidate.url,
+          category: candidate.category,
           summary: candidate.summary,
           tags: candidate.tags
         });
+        const score = Math.min(semanticScore * 0.85 + keyword.score * 0.15, 1);
 
         return {
           bookmarkId: candidate.bookmarkId,
@@ -218,27 +286,29 @@ export class SearchService {
           summary: candidate.summary,
           reviewAction: candidate.reviewAction,
           score,
-          matchReasons: reasons
+          matchReasons: keyword.reasons
         };
       })
       .sort((a, b) => b.score - a.score);
 
-    const deduped = new Map<string, (typeof ranked)[number]>();
-    for (const result of ranked) {
-      const key = `${canonicalUrl(result.url)}|${result.title.trim().toLowerCase()}`;
-      if (!deduped.has(key)) {
-        deduped.set(key, result);
+      const deduped = new Map<string, (typeof ranked)[number]>();
+      for (const result of ranked) {
+        const key = `${canonicalUrl(result.url)}|${result.title.trim().toLowerCase()}`;
+        if (!deduped.has(key)) {
+          deduped.set(key, result);
+        }
       }
+
+      const limited = [...deduped.values()].slice(0, limit);
+
+      return {
+        model: EMBEDDING_MODEL,
+        totalCandidates: candidates.length,
+        results: limited
+      };
+    } catch {
+      return this.keywordFallbackSearch(query, fallbackCandidates, limit);
     }
-
-    const limited = [...deduped.values()]
-      .slice(0, Math.max(1, Math.min(input.limit ?? 20, 100)));
-
-    return {
-      model: EMBEDDING_MODEL,
-      totalCandidates: candidates.length,
-      results: limited
-    };
   }
 
   private async generateEmbeddings(texts: string[], apiKey: string): Promise<number[][]> {
@@ -261,5 +331,51 @@ export class SearchService {
 
     const payload = (await response.json()) as EmbeddingResponse;
     return payload.data.map((item) => item.embedding);
+  }
+
+  private keywordFallbackSearch(
+    query: string,
+    candidates: Awaited<ReturnType<SearchRepository["listSearchCandidates"]>>,
+    limit: number
+  ) {
+    const ranked = candidates
+      .map((candidate) => {
+        const keyword = keywordSignals(query, {
+          title: candidate.title,
+          url: candidate.url,
+          category: candidate.category,
+          summary: candidate.summary,
+          tags: candidate.tags
+        });
+
+        return {
+          bookmarkId: candidate.bookmarkId,
+          title: candidate.title,
+          url: candidate.url,
+          status: candidate.status,
+          category: candidate.category,
+          tags: candidate.tags,
+          summary: candidate.summary,
+          reviewAction: candidate.reviewAction,
+          score: keyword.score,
+          matchReasons: keyword.reasons
+        };
+      })
+      .filter((candidate) => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+
+    const deduped = new Map<string, (typeof ranked)[number]>();
+    for (const result of ranked) {
+      const key = `${canonicalUrl(result.url)}|${result.title.trim().toLowerCase()}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, result);
+      }
+    }
+
+    return {
+      model: "keyword-fallback",
+      totalCandidates: candidates.length,
+      results: [...deduped.values()].slice(0, limit)
+    };
   }
 }

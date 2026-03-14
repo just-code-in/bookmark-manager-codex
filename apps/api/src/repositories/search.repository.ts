@@ -162,7 +162,7 @@ export class SearchRepository {
         be.vector_json
       FROM bookmarks b
       JOIN bookmark_organization bo ON bo.bookmark_id = b.id
-      JOIN bookmark_embeddings be ON be.bookmark_id = b.id
+      LEFT JOIN bookmark_embeddings be ON be.bookmark_id = b.id
       ${whereClause}
       ORDER BY b.title ASC
     `
@@ -178,8 +178,8 @@ export class SearchRepository {
           tags_json: string;
           summary: string | null;
           review_action: ReviewAction;
-          model: string;
-          vector_json: string;
+          model: string | null;
+          vector_json: string | null;
         };
 
         return {
@@ -191,10 +191,9 @@ export class SearchRepository {
           tags: parseTags(typed.tags_json),
           summary: typed.summary,
           reviewAction: typed.review_action,
-          embeddingModel: typed.model,
-          embedding: parseVector(typed.vector_json)
+          embeddingModel: typed.model ?? "",
+          embedding: parseVector(typed.vector_json ?? "[]")
         };
-      })
-      .filter((row) => row.embedding.length > 0);
+      });
   }
 }

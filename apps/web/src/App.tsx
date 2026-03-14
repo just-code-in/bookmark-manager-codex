@@ -46,9 +46,61 @@ type SearchResponse = {
   results: SearchResult[];
 };
 
+type ImportResponse = {
+  importId: string;
+  source: "chrome" | "safari" | "unknown";
+  total: number;
+  imported: number;
+  duplicates: number;
+  live: number;
+  redirected: number;
+  dead: number;
+  timedOut: number;
+  durationMs: number;
+};
+
+type TriageRuntimeStatus = {
+  runId: string;
+  status: "running" | "completed" | "failed";
+  stage:
+    | "idle"
+    | "preparing"
+    | "discovering_categories"
+    | "categorizing"
+    | "summarizing"
+    | "finalizing"
+    | "completed"
+    | "failed";
+  startedAt: string;
+  finishedAt: string | null;
+  totalBookmarks: number;
+  preparedCount: number;
+  processedCount: number;
+  cachedCount: number;
+  categorizedCount: number;
+  uncategorizedCount: number;
+  failedCount: number;
+  apiCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  missingOutputRetriesAttempted: number;
+  missingOutputRetriesRecovered: number;
+  estimatedCostUsd: number;
+  lastError: string | null;
+};
+
 type SortBy = "date_added" | "title" | "category";
 
 const API_BASE = "http://127.0.0.1:4040";
+
+async function readErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = (await response.json()) as { error?: string; message?: string };
+    return payload.error ?? payload.message ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function formatStatusLabel(status: BookmarkStatus) {
   return status === "redirected" ? "redirect" : status;
@@ -56,6 +108,10 @@ function formatStatusLabel(status: BookmarkStatus) {
 
 function formatPercent(value: number): string {
   return `${value.toFixed(1)}%`;
+}
+
+function formatTriageStage(stage: TriageRuntimeStatus["stage"]): string {
+  return stage.replace(/_/g, " ");
 }
 
 export function App() {
@@ -77,6 +133,11 @@ export function App() {
   const [searchResults, setSearchResults] = useState<SearchResponse | null>(null);
   const [searching, setSearching] = useState(false);
   const [syncingEmbeddings, setSyncingEmbeddings] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<ImportResponse | null>(null);
+  const [triageStatus, setTriageStatus] = useState<TriageRuntimeStatus | null>(null);
+  const [triaging, setTriaging] = useState(false);
 
   const [bulkAction, setBulkAction] = useState<"keep" | "archive" | "delete" | "unreviewed">("keep");
   const [bulkCategory, setBulkCategory] = useState("");
@@ -115,7 +176,7 @@ export function App() {
   async function refreshAll() {
     setLoading(true);
     try {
-      await Promise.all([fetchOverview(), fetchBookmarks()]);
+      await Promise.all([fetchOverview(), fetchBookmarks(), fetchTriageStatus()]);
       setError(null);
     } catch (apiError) {
       setError(apiError instanceof Error ? apiError.message : "Failed to refresh.");
@@ -138,6 +199,22 @@ export function App() {
     const ids = new Set(bookmarks.map((bookmark) => bookmark.id));
     setSelectedIds((previous) => previous.filter((id) => ids.has(id)));
   }, [bookmarks]);
+
+  useEffect(() => {
+    if (!triageStatus || triageStatus.status !== "running") return;
+
+    const timer = window.setInterval(() => {
+      void fetchTriageStatus()
+        .then((status) => {
+          if (status?.status === "completed" || status?.status === "failed") {
+            void refreshAll();
+          }
+        })
+        .catch(() => undefined);
+    }, 2500);
+
+    return () => window.clearInterval(timer);
+  }, [triageStatus]);
 
   function toggleSelected(bookmarkId: string) {
     setSelectedIds((previous) =>
@@ -252,12 +329,82 @@ export function App() {
         })
       });
 
-      if (!response.ok) throw new Error("Search failed.");
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Search failed."));
+      }
       setSearchResults((await response.json()) as SearchResponse);
     } catch (apiError) {
       setError(apiError instanceof Error ? apiError.message : "Search failed.");
     } finally {
       setSearching(false);
+    }
+  }
+
+  async function fetchTriageStatus(): Promise<TriageRuntimeStatus | null> {
+    const response = await fetch(`${API_BASE}/triage/status`);
+    if (!response.ok) throw new Error("Failed to load triage status.");
+    const payload = (await response.json()) as { status: TriageRuntimeStatus | null };
+    setTriageStatus(payload.status);
+    return payload.status;
+  }
+
+  async function startTriage(bookmarkIds?: string[]) {
+    setTriaging(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/triage/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ignoreCache: true,
+          bookmarkIds
+        })
+      });
+
+      if (!response.ok && response.status !== 409) {
+        throw new Error(await readErrorMessage(response, "Failed to start triage."));
+      }
+
+      await fetchTriageStatus();
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Failed to start triage.");
+    } finally {
+      setTriaging(false);
+    }
+  }
+
+  async function handleImport() {
+    if (!importFile) {
+      setError("Choose a bookmarks HTML file first.");
+      return;
+    }
+
+    setImporting(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", importFile);
+
+      const response = await fetch(`${API_BASE}/imports`, {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Import failed."));
+      }
+
+      const payload = (await response.json()) as ImportResponse;
+      setImportResult(payload);
+      setImportFile(null);
+      await refreshAll();
+    } catch (apiError) {
+      setError(apiError instanceof Error ? apiError.message : "Import failed.");
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -270,7 +417,9 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({})
       });
-      if (!response.ok) throw new Error("Embedding generation failed.");
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Embedding generation failed."));
+      }
     } catch (apiError) {
       setError(apiError instanceof Error ? apiError.message : "Embedding generation failed.");
     } finally {
@@ -286,6 +435,64 @@ export function App() {
       </p>
 
       {error ? <p className="error">{error}</p> : null}
+
+      <section className="results">
+        <h2 className="section-title">Import Bookmarks</h2>
+        <article className="result-card">
+          <div className="filters">
+            <input
+              type="file"
+              accept=".html,text/html"
+              onChange={(event) => setImportFile(event.currentTarget.files?.[0] ?? null)}
+            />
+            <button type="button" onClick={handleImport} disabled={importing}>
+              {importing ? "Importing..." : "Import file"}
+            </button>
+          </div>
+          <p className="muted">Choose a Safari or Chrome bookmarks export in HTML format.</p>
+          {importFile ? <p>Selected: {importFile.name}</p> : null}
+          {importResult ? (
+            <p>
+              Imported {importResult.imported} of {importResult.total} bookmarks
+              {importResult.duplicates > 0 ? `, skipped ${importResult.duplicates} duplicates` : ""}.
+            </p>
+          ) : null}
+        </article>
+      </section>
+
+      <section className="results">
+        <h2 className="section-title">AI Triage</h2>
+        <article className="result-card">
+          <div className="filters">
+            <button type="button" onClick={() => void startTriage()} disabled={triaging || importing || overview?.stats.totalBookmarks === 0}>
+              {triaging || triageStatus?.status === "running" ? "Categorizing..." : "Categorize all bookmarks"}
+            </button>
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void startTriage(selectedIds)}
+              disabled={triaging || selectedIds.length === 0}
+            >
+              Categorize selected
+            </button>
+          </div>
+          <p className="muted">
+            Generate categories, tags, and summaries for imported bookmarks using your OpenAI API key.
+          </p>
+          {triageStatus ? (
+            <p>
+              <strong>Status:</strong> {triageStatus.status} | <strong>Stage:</strong>{" "}
+              {formatTriageStage(triageStatus.stage)} | <strong>Processed:</strong> {triageStatus.processedCount}/
+              {triageStatus.totalBookmarks} | <strong>Categorized:</strong> {triageStatus.categorizedCount}
+            </p>
+          ) : (
+            <p>No triage run started yet.</p>
+          )}
+          {triageStatus?.lastError ? (
+            <p className="error">{triageStatus.lastError}</p>
+          ) : null}
+        </article>
+      </section>
 
       <section className="results">
         <h2 className="section-title">Organisation Dashboard</h2>
@@ -316,6 +523,78 @@ export function App() {
             </article>
           </>
         ) : null}
+      </section>
+
+      <section className="results">
+        <h2 className="section-title">Natural Language Search</h2>
+        <article className="result-card">
+          <div className="filters">
+            <input
+              placeholder="e.g. recipes I saved from YouTube"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.currentTarget.value)}
+            />
+            <button type="button" className="button-secondary" onClick={handleGenerateEmbeddings} disabled={syncingEmbeddings}>
+              {syncingEmbeddings ? "Generating..." : "Generate embeddings"}
+            </button>
+            <button type="button" onClick={runSearch} disabled={searching}>
+              {searching ? "Searching..." : "Search"}
+            </button>
+          </div>
+        </article>
+
+        {searchResults ? (
+          <>
+            <article className="result-card">
+              <p>
+                <strong>Model:</strong> {searchResults.model} | <strong>Candidates:</strong>{" "}
+                {searchResults.totalCandidates}
+              </p>
+              {searchResults.model === "keyword-fallback" ? (
+                <p className="muted">
+                  Semantic embeddings are unavailable right now, so search is using title, tag, category, summary,
+                  and URL matching instead.
+                </p>
+              ) : null}
+            </article>
+            {searchResults.results.map((result) => (
+              <article key={result.bookmarkId} className="result-card bookmark-card">
+                <header className="bookmark-head">
+                  <a href={result.url} target="_blank" rel="noreferrer">
+                    {result.title}
+                  </a>
+                  <span className={`status-badge status-${result.status}`}>{formatStatusLabel(result.status)}</span>
+                </header>
+                <p className="bookmark-url">{result.url}</p>
+                <p>
+                  <strong>Relevance:</strong> {(result.score * 100).toFixed(1)}%
+                </p>
+                <p>
+                  <strong>Category:</strong> {result.category ?? "Uncategorized"} | <strong>Action:</strong>{" "}
+                  {result.reviewAction}
+                </p>
+                <p>
+                  <strong>Summary:</strong> {result.summary ?? "No summary"}
+                </p>
+                <p>
+                  <strong>Why matched:</strong>{" "}
+                  {result.matchReasons.length > 0 ? result.matchReasons.join("; ") : "semantic similarity"}
+                </p>
+              </article>
+            ))}
+            {searchResults.results.length === 0 ? (
+              <article className="result-card empty-state">
+                <p>No results found for this query.</p>
+                <p className="muted">Try a broader query or remove category/tag constraints.</p>
+              </article>
+            ) : null}
+          </>
+        ) : (
+          <article className="result-card empty-state">
+            <p>Search results will appear here.</p>
+            <p className="muted">Try a natural language query like “articles about investing”.</p>
+          </article>
+        )}
       </section>
 
       <section className="results">
@@ -453,71 +732,6 @@ export function App() {
         ))}
       </section>
 
-      <section className="results">
-        <h2 className="section-title">Natural Language Search</h2>
-        <article className="result-card">
-          <div className="filters">
-            <input
-              placeholder="e.g. recipes I saved from YouTube"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.currentTarget.value)}
-            />
-            <button type="button" className="button-secondary" onClick={handleGenerateEmbeddings} disabled={syncingEmbeddings}>
-              {syncingEmbeddings ? "Generating..." : "Generate embeddings"}
-            </button>
-            <button type="button" onClick={runSearch} disabled={searching}>
-              {searching ? "Searching..." : "Search"}
-            </button>
-          </div>
-        </article>
-
-        {searchResults ? (
-          <>
-            <article className="result-card">
-              <p>
-                <strong>Model:</strong> {searchResults.model} | <strong>Candidates:</strong>{" "}
-                {searchResults.totalCandidates}
-              </p>
-            </article>
-            {searchResults.results.map((result) => (
-              <article key={result.bookmarkId} className="result-card bookmark-card">
-                <header className="bookmark-head">
-                  <a href={result.url} target="_blank" rel="noreferrer">
-                    {result.title}
-                  </a>
-                  <span className={`status-badge status-${result.status}`}>{formatStatusLabel(result.status)}</span>
-                </header>
-                <p className="bookmark-url">{result.url}</p>
-                <p>
-                  <strong>Relevance:</strong> {(result.score * 100).toFixed(1)}%
-                </p>
-                <p>
-                  <strong>Category:</strong> {result.category ?? "Uncategorized"} | <strong>Action:</strong>{" "}
-                  {result.reviewAction}
-                </p>
-                <p>
-                  <strong>Summary:</strong> {result.summary ?? "No summary"}
-                </p>
-                <p>
-                  <strong>Why matched:</strong>{" "}
-                  {result.matchReasons.length > 0 ? result.matchReasons.join("; ") : "semantic similarity"}
-                </p>
-              </article>
-            ))}
-            {searchResults.results.length === 0 ? (
-              <article className="result-card empty-state">
-                <p>No results found for this query.</p>
-                <p className="muted">Try a broader query or remove category/tag constraints.</p>
-              </article>
-            ) : null}
-          </>
-        ) : (
-          <article className="result-card empty-state">
-            <p>Search results will appear here.</p>
-            <p className="muted">Try a natural language query like “articles about investing”.</p>
-          </article>
-        )}
-      </section>
     </main>
   );
 }
