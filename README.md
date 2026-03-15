@@ -1,6 +1,6 @@
 # Bookmark Manager (built by OpenAI Codex)
 
-> **NOTE** ⚠️ This application does not work reliably.
+> **NOTE ⚠️ This application does not work reliably.**
 >This repository exists as one half of the Built Twice experiment — the same bookmark manager spec given to two AI coding tools, built independently. This is the **OpenAI Codex** build.
 
 >What happened: Codex completed all four build phases (Import, Triage, Organisation, Search), but the finished product has significant gaps. Triage categorised only 70% of bookmarks (vs 92% from the Claude Code build). Search was implemented without embeddings — it missed roughly 30% of the collection and couldn't find bookmarks by meaning, only by keyword matching.
