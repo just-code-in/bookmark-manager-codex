@@ -30,7 +30,7 @@ The app has four features, each built around a different stage of dealing with a
 
 4. **Search** — Find bookmarks by describing what you're looking for in everyday language. The app understands meaning, not just keywords — so "that article about productivity systems I saved last year" will find it, even if the word "productivity" doesn't appear anywhere in the title or URL.
 
-<img src="docs/images/home_codex.png" alt="Bookmark Manager home screen" width="700">
+<img src="docs/images/home.png" alt="Bookmark Manager home screen" width="700">
 
 ---
 
